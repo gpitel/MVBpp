@@ -14,6 +14,7 @@
 #include "mvb/shapes/ShapeRM.h"
 #include "mvb/shapes/ShapeT.h"
 #include "mvb/shapes/ShapeU.h"
+#include "mvb/shapes/ShapeUi.h"
 #include "mvb/shapes/ShapeUr.h"
 #include "mvb/shapes/ShapeUt.h"
 #include <memory>
@@ -51,6 +52,8 @@ std::unique_ptr<ShapeBuilder> createShapeBuilder(MAS::CoreShapeFamily family,
             break;
         case MAS::CoreShapeFamily::U:
             builder = std::make_unique<ShapeU>(); break;
+        case MAS::CoreShapeFamily::UI:  // U piece + flat I plate, one fused solid
+            builder = std::make_unique<ShapeUi>(); break;
         case MAS::CoreShapeFamily::UR:
             builder = std::make_unique<ShapeUr>(); break;
         case MAS::CoreShapeFamily::UT:

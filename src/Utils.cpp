@@ -232,6 +232,8 @@ std::string core_shape_family_to_string(MAS::CoreShapeFamily family) {
         case MAS::CoreShapeFamily::ROD: return "rod";
         case MAS::CoreShapeFamily::T: return "t";
         case MAS::CoreShapeFamily::U: return "u";
+        case MAS::CoreShapeFamily::UI: return "ui";
+        case MAS::CoreShapeFamily::UR: return "ur";
         case MAS::CoreShapeFamily::UT: return "ut";
     }
     return "unknown";
