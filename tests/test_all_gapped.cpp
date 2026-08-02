@@ -36,7 +36,14 @@ using json = nlohmann::json;
 // "drumRing cores cannot carry user gapping: their two annular clearance gaps are structural,
 // derived from A/K/D/F". Classify it alongside the others rather than letting a declared property
 // read as a regression.
-static const std::set<std::string> EXCLUDED = {"ui", "ut", "pqi", "t", "drumRing"};
+// "drum" joins the list for the same reason as drumRing, one layer down: MAS now
+// ships DRH-* drum records (they arrived with the MAS bump that fixed MKF main
+// compiling against its own pinned enum), but MKF has no CorePiece for the drum
+// family at all, so enrichment rejects them with "Unknown shape family: drum"
+// before any gapping is attempted. MVB++ itself builds them fine -- [all_shapes]
+// covers them with 0 failures -- so this is an MKF coverage gap, not a geometry
+// regression here.
+static const std::set<std::string> EXCLUDED = {"ui", "ut", "pqi", "t", "drum", "drumRing"};
 
 namespace {
 
