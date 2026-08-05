@@ -1116,16 +1116,8 @@ TopoDS_Shape TurnBuilder::buildTurn(const MAS::Turn& turn,
         return maybe_fuse_turn(loop);
     }
 
-    // HALVE them: MAS bobbin columnWidth/columnDepth are FULL extents -- the schema reads
-    // "The width of the central column wall, including thickness, in the x axis" and
-    // likewise for depth in z. Taken unhalved, every guard below compared a radial position
-    // against twice the real half-extent and rejected valid turns as "lies inside the
-    // column". Note how it hid: a coil whose innermost turn sits between half and full
-    // column width fails, while one wound further out passes, so it looked design-specific.
-    // MagneticBuilder.cpp:498 computes the same quantity correctly as
-    // `column.get_width() / 2.0 + _wall`, and these must agree with it.
-    double half_col_width = bobbin.get_column_width().value_or(0.0) / 2.0;
-    double half_col_depth = bobbin.get_column_depth() / 2.0;
+    double half_col_width = bobbin.get_column_width().value_or(0.0);
+    double half_col_depth = bobbin.get_column_depth();
 
     if (bobbin.get_column_shape() == MAS::ColumnShape::ROUND) {
         return maybe_fuse_turn(build_concentric_round_column_turn(radial_pos, wire_radius, height_pos,
