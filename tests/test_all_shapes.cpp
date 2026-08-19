@@ -18,7 +18,7 @@
 
 using json = nlohmann::json;
 
-static const std::set<std::string> EXCLUDED_FAMILIES = {"ui", "pqi", "ut"};
+static const std::set<std::string> EXCLUDED_FAMILIES = {"pqi"};
 
 #ifndef MAS_DATA_DIR
 #define MAS_DATA_DIR "."
@@ -112,7 +112,7 @@ TEST_CASE("All MAS families are supported by the factory",
 
     std::vector<std::string> unsupported;
     for (const auto& fam : families) {
-        if (fam == "ui" || fam == "pqi") continue;  // MVB Python excludes these
+        if (fam == "pqi") continue;  // no CorePiece/builder for PQI yet
         // Look up via a minimal CoreShape just to test factory routing
         json stub = {{"family", fam}, {"name", "stub"},
                      {"type", "standard"}, {"dimensions", json::object()}};

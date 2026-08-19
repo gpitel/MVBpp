@@ -232,6 +232,8 @@ std::string core_shape_family_to_string(MAS::CoreShapeFamily family) {
         case MAS::CoreShapeFamily::ROD: return "rod";
         case MAS::CoreShapeFamily::T: return "t";
         case MAS::CoreShapeFamily::U: return "u";
+        case MAS::CoreShapeFamily::UI: return "ui";
+        case MAS::CoreShapeFamily::UR: return "ur";
         case MAS::CoreShapeFamily::UT: return "ut";
     }
     return "unknown";
@@ -302,6 +304,14 @@ OpenMagnetics::Magnetic magnetic_autocomplete_safe(const nlohmann::json& magneti
         auto shapeFamily = mutCore.get_shape_family();
         if (shapeFamily == MAS::CoreShapeFamily::T) {
             mutCore.get_mutable_functional_description().set_type(MAS::CoreType::TOROIDAL);
+        } else if (OpenMagnetics::Core::is_piece_and_plate_family(shapeFamily)) {
+            // A UI or PQI core is one piece closed by a flat plate, never a mirrored pair.
+            // Stamping TWO_PIECE_SET here sent process_data down its mirrored-pair branch,
+            // which DOUBLES the column height, winding-window height and area, le and
+            // effective volume -- so a core-only 3D preview was drawn at twice the real
+            // window height, with no error to say so. Same clobber MKF's own
+            // magnetic_autocomplete used to do.
+            mutCore.get_mutable_functional_description().set_type(MAS::CoreType::PIECE_AND_PLATE);
         } else {
             mutCore.get_mutable_functional_description().set_type(MAS::CoreType::TWO_PIECE_SET);
         }
