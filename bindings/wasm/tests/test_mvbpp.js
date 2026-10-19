@@ -39,6 +39,55 @@ function assertEqual(a, b, msg) {
 
 // ── helpers ───────────────────────────────────────────────────────────────────
 
+function assertClose(a, b, tol, msg) {
+    if (!(Math.abs(a - b) <= tol)) throw new Error(`${msg || 'assertClose'}: expected ${b} +- ${tol}, got ${a}`);
+}
+
+// Parse a binary STL (80-byte header, uint32 count, 50 bytes per triangle).
+// The mesh is written in millimetres; bounds and vertices come back in metres.
+function stlBounds(buf) {
+    const b = Buffer.from(buf);
+    const n = b.readUInt32LE(80);
+    const min = [Infinity, Infinity, Infinity];
+    const max = [-Infinity, -Infinity, -Infinity];
+    const verts = [];
+    for (let t = 0; t < n; t++) {
+        const base = 84 + 50 * t + 12;           // skip the normal
+        for (let v = 0; v < 3; v++) {
+            const p = [0, 1, 2].map(k => b.readFloatLE(base + 12 * v + 4 * k) / 1000);
+            verts.push(p);
+            for (let k = 0; k < 3; k++) {
+                if (p[k] < min[k]) min[k] = p[k];
+                if (p[k] > max[k]) max[k] = p[k];
+            }
+        }
+    }
+    return {
+        min, max,
+        hasVertexAt: (axis, value, tol) => verts.some(p => Math.abs(p[axis] - value) <= tol),
+    };
+}
+
+const TWO_CHAMBER = {
+    name: 'test two-chamber round bobbin',
+    processedDescription: {
+        columnShape: 'round', columnWidth: 0.0029, columnDepth: 0.0029,
+        columnThickness: 0.0006, wallThickness: 0.0006,
+        windingWindows: [
+            { width: 0.0019, height: 0.0034, coordinates: [0.00385, 0.0021] },
+            { width: 0.0019, height: 0.0034, coordinates: [0.00385, -0.0021] },
+        ],
+    },
+};
+const ONE_WINDOW = {
+    name: 'test one-window rectangular bobbin',
+    processedDescription: {
+        columnShape: 'rectangular', columnWidth: 0.0037, columnDepth: 0.0133,
+        columnThickness: 0.0009, wallThickness: 0.0009,
+        windingWindows: [{ width: 0.0066, height: 0.0184, coordinates: [0.0107, 0.0] }],
+    },
+};
+
 function loadMagneticJson(filename) {
     const raw  = fs.readFileSync(path.join(TESTS_DIR, filename), 'utf8');
     const data = JSON.parse(raw);
@@ -56,6 +105,8 @@ function bufferToString(buf) {
 
 // Default parameter pack for drawXxx (all 9 trailing args)
 const DEF_3D = ['3D', 'XY', 0.0, 'step', 1.0, 32, 'none', '+X+Y+Z'];
+// Binary STL out, metres, no side-view crop.
+const STL = ['3D', 'XY', 0.0, 'stl', 1.0, 32, 'none', ''];
 const DEF_2D = ['2D', 'XY', 0.0, 'step', 1.0, 32, 'none', ''];
 const NO_SIDE = ['3D', 'XY', 0.0, 'step', 1.0, 32, 'none', ''];
 
@@ -281,6 +332,21 @@ async function main() {
         catch (e) { threw = true; }
         assert(!threw, 'drawBobbin must not throw on a no-bobbin (planar) core');
         assert(result.length === 0, 'no-bobbin core should yield empty bobbin output');
+    });
+
+    test('drawBobbin builds every chamber of a two-chamber bobbin', () => {
+        // Two 3.4 mm chambers at y = +-2.1 mm leave a 0.8 mm gap for the divider.
+        const b = stlBounds(mvbpp.drawBobbin(JSON.stringify(TWO_CHAMBER), ...STL));
+        assertClose(b.max[1] - b.min[1], 0.0088, 1e-7, 'axial extent: 2 x 3.4 + 0.8 + 2 x 0.6 mm');
+        assertClose(b.max[0] - b.min[0], 0.0096, 1e-7, 'flange: 2 x (2.9 + 1.9) mm');
+        assert(b.hasVertexAt(1, 0.0004, 1e-7) && b.hasVertexAt(1, -0.0004, 1e-7), 'divider faces at y = +-0.4 mm');
+    });
+
+    test('drawBobbin builds a one-window bobbin as before', () => {
+        const b = stlBounds(mvbpp.drawBobbin(JSON.stringify(ONE_WINDOW), ...STL));
+        assertClose(b.max[1] - b.min[1], 0.0202, 1e-7, 'axial: 18.4 + 2 x 0.9 mm');
+        assertClose(b.max[0] - b.min[0], 0.0206, 1e-7, 'flange width: 2 x (3.7 + 6.6) mm');
+        assertClose(b.max[2] - b.min[2], 0.0398, 1e-7, 'flange depth: 2 x (13.3 + 6.6) mm');
     });
 
     // ── drawTurns ────────────────────────────────────────────────────────────
