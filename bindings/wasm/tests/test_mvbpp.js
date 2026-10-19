@@ -50,22 +50,38 @@ function stlBounds(buf) {
     const n = b.readUInt32LE(80);
     const min = [Infinity, Infinity, Infinity];
     const max = [-Infinity, -Infinity, -Infinity];
-    const verts = [];
+    const verts = [], tris = [];
     for (let t = 0; t < n; t++) {
         const base = 84 + 50 * t + 12;           // skip the normal
+        const tri = [];
         for (let v = 0; v < 3; v++) {
             const p = [0, 1, 2].map(k => b.readFloatLE(base + 12 * v + 4 * k) / 1000);
             verts.push(p);
+            tri.push(p);
             for (let k = 0; k < 3; k++) {
                 if (p[k] < min[k]) min[k] = p[k];
                 if (p[k] > max[k]) max[k] = p[k];
             }
         }
+        tris.push(tri);
     }
+    // Signed volume by the divergence theorem: exact for closed, outward-facing solids.
+    const volume = tris.reduce((s, [a, c, d]) => s + (a[0] * (c[1] * d[2] - c[2] * d[1])
+        - a[1] * (c[0] * d[2] - c[2] * d[0]) + a[2] * (c[0] * d[1] - c[1] * d[0])) / 6, 0);
     return {
-        min, max, verts,
+        min, max, verts, tris, volume,
         hasVertexAt: (axis, value, tol) => verts.some(p => Math.abs(p[axis] - value) <= tol),
     };
+}
+
+// Area of the regular polygon a round column is built from (vertices on the circle).
+const polygonArea = (r, n) => 0.5 * n * r * r * Math.sin(2 * Math.PI / n);
+
+// Where a rectangular tube's flat face on z = +-halfDepth ends: halfWidth less the
+// tube's outer corner radius.
+function flatFaceEnd(b, halfWidth, halfDepth) {
+    const onFace = b.verts.filter(p => Math.abs(Math.abs(p[2]) - halfDepth) <= 1e-7 && Math.abs(p[0]) <= halfWidth + 1e-7);
+    return Math.max(...onFace.map(p => Math.abs(p[0])));
 }
 
 const TWO_CHAMBER = {
@@ -340,12 +356,18 @@ async function main() {
         assertClose(b.max[1] - b.min[1], 0.0088, 1e-7, 'axial extent: 2 x 3.4 + 0.8 + 2 x 0.6 mm');
         assertClose(b.max[0] - b.min[0], 0.0096, 1e-7, 'flange: 2 x (2.9 + 1.9) mm');
         assert(b.hasVertexAt(1, 0.0004, 1e-7) && b.hasVertexAt(1, -0.0004, 1e-7), 'divider faces at y = +-0.4 mm');
-        // The divider abuts the tube's outer surface. A divider cut at the bore
-        // overlaps the tube wall: its bore-radius hole puts vertices on the divider
-        // faces inside the tube's outer radius. The faces count (<=), because the
-        // tube wall itself has no vertex strictly between them.
-        const inWall = b.verts.filter(p => Math.abs(p[1]) <= 0.0004 + 1e-7 && Math.hypot(p[0], p[2]) < 0.0029 - 1e-7);
-        assertEqual(inWall.length, 0, 'no vertex on or between the divider faces inside the tube outer radius');
+        // A moulded bobbin is one part, so the tube stops at the divider. A tube
+        // running through it leaves its edges inside the divider, and a drawing
+        // shows them as false hidden lines. No face may reach across the divider.
+        const across = b.tris.filter(t => Math.min(...t.map(p => p[1])) < -0.0004 - 1e-7
+                                       && Math.max(...t.map(p => p[1])) > 0.0004 + 1e-7);
+        assertEqual(across.length, 0, 'no face reaches from one chamber to the other');
+        // No overlap and no gap: two 3.4 mm tube rings from the bore (2.3 mm) to
+        // the tube (2.9 mm), and a 0.8 mm divider plus two 0.6 mm flanges from the
+        // bore to the flange (4.8 mm).
+        const ring = (outer, inner) => polygonArea(outer, 32) - polygonArea(inner, 32);
+        const expected = 2 * 0.0034 * ring(0.0029, 0.0023) + (0.0008 + 2 * 0.0006) * ring(0.0048, 0.0023);
+        assertClose(b.volume, expected, 1e-4 * expected, 'volume');
     });
 
     test('drawBobbin builds a one-window bobbin as before', () => {
@@ -353,6 +375,21 @@ async function main() {
         assertClose(b.max[1] - b.min[1], 0.0202, 1e-7, 'axial: 18.4 + 2 x 0.9 mm');
         assertClose(b.max[0] - b.min[0], 0.0206, 1e-7, 'flange width: 2 x (3.7 + 6.6) mm');
         assertClose(b.max[2] - b.min[2], 0.0398, 1e-7, 'flange depth: 2 x (13.3 + 6.6) mm');
+    });
+
+    test('drawBobbin rounds a rectangular tube with the engine corner radius', () => {
+        // OpenMagnetics::Bobbin::get_column_corner_radius, the radius MKF winds the
+        // turns around: with no columnCornerRadius, half the column thickness
+        // (0.45 mm). The flat face on z = 13.3 mm then ends at x = 3.7 - 0.45 mm.
+        const b = stlBounds(mvbpp.drawBobbin(JSON.stringify(ONE_WINDOW), ...STL));
+        assertClose(flatFaceEnd(b, 0.0037, 0.0133), 0.0037 - 0.00045, 1e-7, 'flat face end');
+    });
+
+    test('drawBobbin rounds a rectangular tube with the record corner radius', () => {
+        const record = JSON.parse(JSON.stringify(ONE_WINDOW));
+        record.processedDescription.columnCornerRadius = 0.0002;
+        const b = stlBounds(mvbpp.drawBobbin(JSON.stringify(record), ...STL));
+        assertClose(flatFaceEnd(b, 0.0037, 0.0133), 0.0037 - 0.0002, 1e-7, 'flat face end');
     });
 
     // ── drawTurns ────────────────────────────────────────────────────────────
