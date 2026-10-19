@@ -170,19 +170,19 @@ TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescriptio
 
         if (hasFlanges) {
             double flangeOuterR = outerR + wwWidth;
-            auto make_flange = [&](double zBottom, double thickness, const char* ctx) -> TopoDS_Shape {
+            auto make_flange = [&](double zBottom, double thickness, double holeR, const char* ctx) -> TopoDS_Shape {
                 double holeHeight = thickness * 1.2;
                 double holeMargin = (holeHeight - thickness) / 2.0;
                 TopoDS_Shape disc = make_cyl(flangeOuterR, thickness, zBottom);
-                TopoDS_Shape hole = make_cyl(innerR, holeHeight, zBottom - holeMargin);
+                TopoDS_Shape hole = make_cyl(holeR, holeHeight, zBottom - holeMargin);
                 BRepAlgoAPI_Cut cut(disc, hole);
                 checkIsDone(cut, ctx);
                 return cut.Shape();
             };
-            TopoDS_Shape topFlange = make_flange(zHigh, flangeThickness, "round top flange");
-            TopoDS_Shape bottomFlange = make_flange(zLow - flangeThickness, flangeThickness, "round bottom flange");
+            TopoDS_Shape topFlange = make_flange(zHigh, flangeThickness, innerR, "round top flange");
+            TopoDS_Shape bottomFlange = make_flange(zLow - flangeThickness, flangeThickness, innerR, "round bottom flange");
 
-            // Skip the Fuse: return body + flanges as a compound of 3 solids.
+            // Skip the Fuse: return body, flanges and dividers as one compound.
             // Downstream cut_bobbin can then AABB-prefilter tools per solid;
             // most turns sit in the winding window and don't intersect the
             // flange AABBs, so per-solid cuts run against far fewer tools.
@@ -192,7 +192,10 @@ TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescriptio
             bld.Add(comp, body);
             bld.Add(comp, topFlange);
             bld.Add(comp, bottomFlange);
-            for (const auto& g : gaps) bld.Add(comp, make_flange(g.bottom, g.top - g.bottom, "round divider"));
+            // A divider's hole is the tube's OUTER surface, not the bore. A divider
+            // cut at the bore overlaps the tube wall, and the tube's outer edge then
+            // shows through the divider as a false hidden line on a drawing.
+            for (const auto& g : gaps) bld.Add(comp, make_flange(g.bottom, g.top - g.bottom, outerR, "round divider"));
             bobbinShape = comp;
         } else {
             bobbinShape = body;
@@ -235,25 +238,29 @@ TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescriptio
             double flangeDepth = 2.0 * (colDepth + wwWidth);
             const double rFlange = roundCorners ? 0.25 * std::min(flangeWidth, flangeDepth) : 0.0;
 
-            auto make_flange = [&](double zBottom, double thickness, const char* ctx) -> TopoDS_Shape {
+            auto make_flange = [&](double zBottom, double thickness, bool isDivider, const char* ctx) -> TopoDS_Shape {
                 double holeEps = thickness * 0.1;
                 TopoDS_Shape plate = makeRoundedRectPrism(flangeWidth, flangeDepth, thickness, rFlange, zBottom);
-                TopoDS_Shape hole = makeRoundedRectPrism(holeWidth, holeDepth, thickness + 2.0 * holeEps, rInner, zBottom - holeEps);
+                // A divider's hole is the tube's outer outline (see the round path);
+                // an end flange's hole stays the bore.
+                TopoDS_Shape hole = isDivider
+                    ? makeRoundedRectPrism(outerWidth, outerDepth, thickness + 2.0 * holeEps, rOuter, zBottom - holeEps)
+                    : makeRoundedRectPrism(holeWidth, holeDepth, thickness + 2.0 * holeEps, rInner, zBottom - holeEps);
                 BRepAlgoAPI_Cut cut(plate, hole);
                 checkIsDone(cut, ctx);
                 return cut.Shape();
             };
-            TopoDS_Shape topFlange = make_flange(zHigh, flangeThickness, "rect top flange");
-            TopoDS_Shape bottomFlange = make_flange(zLow - flangeThickness, flangeThickness, "rect bottom flange");
+            TopoDS_Shape topFlange = make_flange(zHigh, flangeThickness, false, "rect top flange");
+            TopoDS_Shape bottomFlange = make_flange(zLow - flangeThickness, flangeThickness, false, "rect bottom flange");
 
-            // Skip the Fuse: compound body + flanges as 3 solids (see round path).
+            // Skip the Fuse: compound of body, flanges and dividers (see round path).
             TopoDS_Compound comp;
             BRep_Builder bld;
             bld.MakeCompound(comp);
             bld.Add(comp, bodyCut.Shape());
             bld.Add(comp, topFlange);
             bld.Add(comp, bottomFlange);
-            for (const auto& g : gaps) bld.Add(comp, make_flange(g.bottom, g.top - g.bottom, "rect divider"));
+            for (const auto& g : gaps) bld.Add(comp, make_flange(g.bottom, g.top - g.bottom, true, "rect divider"));
             bobbinShape = comp;
         } else {
             bobbinShape = bodyCut.Shape();

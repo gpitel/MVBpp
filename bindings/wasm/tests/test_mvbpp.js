@@ -63,7 +63,7 @@ function stlBounds(buf) {
         }
     }
     return {
-        min, max,
+        min, max, verts,
         hasVertexAt: (axis, value, tol) => verts.some(p => Math.abs(p[axis] - value) <= tol),
     };
 }
@@ -105,7 +105,7 @@ function bufferToString(buf) {
 
 // Default parameter pack for drawXxx (all 9 trailing args)
 const DEF_3D = ['3D', 'XY', 0.0, 'step', 1.0, 32, 'none', '+X+Y+Z'];
-// Binary STL out, metres, no side-view crop.
+// Binary STL out (the helper converts mm to metres), no side-view crop.
 const STL = ['3D', 'XY', 0.0, 'stl', 1.0, 32, 'none', ''];
 const DEF_2D = ['2D', 'XY', 0.0, 'step', 1.0, 32, 'none', ''];
 const NO_SIDE = ['3D', 'XY', 0.0, 'step', 1.0, 32, 'none', ''];
@@ -340,6 +340,12 @@ async function main() {
         assertClose(b.max[1] - b.min[1], 0.0088, 1e-7, 'axial extent: 2 x 3.4 + 0.8 + 2 x 0.6 mm');
         assertClose(b.max[0] - b.min[0], 0.0096, 1e-7, 'flange: 2 x (2.9 + 1.9) mm');
         assert(b.hasVertexAt(1, 0.0004, 1e-7) && b.hasVertexAt(1, -0.0004, 1e-7), 'divider faces at y = +-0.4 mm');
+        // The divider abuts the tube's outer surface. A divider cut at the bore
+        // overlaps the tube wall: its bore-radius hole puts vertices on the divider
+        // faces inside the tube's outer radius. The faces count (<=), because the
+        // tube wall itself has no vertex strictly between them.
+        const inWall = b.verts.filter(p => Math.abs(p[1]) <= 0.0004 + 1e-7 && Math.hypot(p[0], p[2]) < 0.0029 - 1e-7);
+        assertEqual(inWall.length, 0, 'no vertex on or between the divider faces inside the tube outer radius');
     });
 
     test('drawBobbin builds a one-window bobbin as before', () => {

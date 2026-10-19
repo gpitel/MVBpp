@@ -400,7 +400,7 @@ TopoDS_Shape cut_bobbin(const TopoDS_Shape& bobbin, const std::vector<TopoDS_Sha
     if (scaledTools.empty()) return bobbin;
 
     // Iterate solids in the bobbin. BobbinBuilder returns a compound of
-    // body + topFlange + bottomFlange (3 solids) when flanges are present.
+    // body, flanges and dividers (one solid each) when flanges are present.
     // Per-solid AABB prefiltering means flange cuts only see the few turns
     // whose AABB actually pokes into the flange volume — typically 0 for a
     // tall winding. Drops `Cut` tool count from O(N) total to O(few) per
