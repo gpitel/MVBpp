@@ -192,9 +192,12 @@ TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescriptio
             bld.Add(comp, body);
             bld.Add(comp, topFlange);
             bld.Add(comp, bottomFlange);
-            // A divider's hole is the tube's OUTER surface, not the bore. A divider
-            // cut at the bore overlaps the tube wall, and the tube's outer edge then
-            // shows through the divider as a false hidden line on a drawing.
+            // A divider's hole is the tube's OUTER surface, not the bore, so the
+            // divider no longer overlaps the tube wall: no overlapping solids and
+            // no double-counted volume. It does not remove every false edge on a
+            // drawing: the tube body still runs continuously under the divider, so
+            // its outer edge inside the divider projects as a short hidden line.
+            // Removing that needs a tube built per chamber.
             for (const auto& g : gaps) bld.Add(comp, make_flange(g.bottom, g.top - g.bottom, outerR, "round divider"));
             bobbinShape = comp;
         } else {
