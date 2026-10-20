@@ -1,5 +1,6 @@
 #include "mvb/BobbinBuilder.h"
 #include "mvb/Utils.h"
+#include "constructive_models/Bobbin.h"
 #include <TopExp_Explorer.hxx>
 #include <TopAbs_ShapeEnum.hxx>
 #include <TopTools_ListOfShape.hxx>
@@ -111,20 +112,51 @@ TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescriptio
     }
 
     const auto& wwList = bobbin.get_winding_windows();
+    // A chambered bobbin (EP, a split bobbin) has one winding window per chamber.
+    // This used to read window 0 only and centre the tube on zero, so a
+    // two-chamber bobbin came out one chamber long: the app and every drawing
+    // showed a part about half its real length. Now the tube spans every window
+    // at its own axial coordinate, with a divider in each gap between chambers.
+    struct Chamber { double bottom; double top; };
+    std::vector<Chamber> chambers;
     double wwWidth = 0.0;
-    double wwHeight = 0.0;
-    double wwDepth = 0.0;
-    if (!wwList.empty()) {
-        wwWidth = wwList[0].get_width().value_or(0.0);
-        wwHeight = wwList[0].get_height().value_or(0.0);
-        wwDepth = wwList[0].get_radial_height().value_or(wwWidth);
+    for (const auto& ww : wwList) {
+        double h = ww.get_height().value_or(0.0);
+        if (h <= 0.0) continue;
+        double centre = 0.0;
+        if (ww.get_coordinates() && ww.get_coordinates()->size() > 1) centre = (*ww.get_coordinates())[1];
+        chambers.push_back({centre - h / 2.0, centre + h / 2.0});
+        wwWidth = std::max(wwWidth, ww.get_width().value_or(0.0));
     }
+    if (chambers.empty()) chambers.push_back({-colDepth / 2.0, colDepth / 2.0});
     if (wwWidth <= 0.0) wwWidth = colWidth;
-    if (wwHeight <= 0.0) wwHeight = colDepth;
-    if (wwDepth <= 0.0) wwDepth = wwWidth;
+    std::sort(chambers.begin(), chambers.end(), [](const Chamber& a, const Chamber& b) { return a.bottom < b.bottom; });
 
-    double height = wwHeight;
+    const double zLow = chambers.front().bottom;
+    double zHigh = chambers.front().top;
+    // Gaps between consecutive chambers: each gets a divider as thick as the gap.
+    std::vector<Chamber> gaps;
+    for (size_t i = 1; i < chambers.size(); ++i) {
+        if (chambers[i].bottom - zHigh > 1e-9) gaps.push_back({zHigh, chambers[i].bottom});
+        zHigh = std::max(zHigh, chambers[i].top);
+    }
+    const double height = zHigh - zLow;
     if (height <= 0.0) return TopoDS_Shape();
+
+    // The tube is built in pieces that stop at the dividers, and every plate (an
+    // end flange or a divider) is cut at the bore. A moulded bobbin is one part: a
+    // tube running through a divider leaves its edges inside the divider, and a
+    // drawing shows them as false hidden lines. Without flanges no divider is
+    // built either, so the tube stays in one piece.
+    std::vector<Chamber> tubeSpans;
+    double spanBottom = zLow;
+    if (hasFlanges) {
+        for (const auto& g : gaps) {
+            tubeSpans.push_back({spanBottom, g.bottom});
+            spanBottom = g.top;
+        }
+    }
+    tubeSpans.push_back({spanBottom, zHigh});
 
     TopoDS_Shape bobbinShape;
 
@@ -133,56 +165,49 @@ TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescriptio
         double innerR = colWidth - bobbin.get_column_thickness();
         if (innerR <= 0.0) innerR = outerR - wallThickness;
 
-        // Build the cylinder along +Z then translate down by height/2 so it
-        // straddles z=0 (matches the legacy MakeCylinder placement).
+        // Build the cylinder along +Z, then translate it to its axial position.
         auto make_cyl = [&](double radius, double h, double zBottom) -> TopoDS_Shape {
             TopoDS_Shape c = build_polygon_cylinder(h, radius, polygonSegments);
             return translate_shape(c, 0.0, 0.0, zBottom);
         };
 
-        TopoDS_Shape outerCyl = make_cyl(outerR, height, -height / 2.0);
-
-        TopoDS_Shape body;
-        if (innerR + 1e-9 >= outerR) {
-            body = outerCyl;
-        } else {
-            double innerHeight = height * 1.1;
-            TopoDS_Shape innerCyl = make_cyl(innerR, innerHeight, -innerHeight / 2.0);
+        auto make_tube = [&](const Chamber& span) -> TopoDS_Shape {
+            double h = span.top - span.bottom;
+            TopoDS_Shape outerCyl = make_cyl(outerR, h, span.bottom);
+            if (innerR + 1e-9 >= outerR) return outerCyl;
+            double innerHeight = h * 1.1;
+            TopoDS_Shape innerCyl = make_cyl(innerR, innerHeight, span.bottom - (innerHeight - h) / 2.0);
             BRepAlgoAPI_Cut cutOp(outerCyl, innerCyl);
             checkIsDone(cutOp, "round body hollow");
-            body = cutOp.Shape();
-        }
+            return cutOp.Shape();
+        };
 
         if (hasFlanges) {
             double flangeOuterR = outerR + wwWidth;
-            double holeHeight = flangeThickness * 1.2;
-            double holeMargin = (holeHeight - flangeThickness) / 2.0;
+            auto make_flange = [&](double zBottom, double thickness, const char* ctx) -> TopoDS_Shape {
+                double holeHeight = thickness * 1.2;
+                double holeMargin = (holeHeight - thickness) / 2.0;
+                TopoDS_Shape disc = make_cyl(flangeOuterR, thickness, zBottom);
+                TopoDS_Shape hole = make_cyl(innerR, holeHeight, zBottom - holeMargin);
+                BRepAlgoAPI_Cut cut(disc, hole);
+                checkIsDone(cut, ctx);
+                return cut.Shape();
+            };
 
-            TopoDS_Shape topFlangeDisc = make_cyl(flangeOuterR, flangeThickness, height / 2.0);
-            TopoDS_Shape topHole = make_cyl(innerR, holeHeight, height / 2.0 - holeMargin);
-            BRepAlgoAPI_Cut topCut(topFlangeDisc, topHole);
-            checkIsDone(topCut, "round top flange");
-
-            TopoDS_Shape bottomFlangeDisc = make_cyl(flangeOuterR, flangeThickness,
-                                                     -(height / 2.0 + flangeThickness));
-            TopoDS_Shape bottomHole = make_cyl(innerR, holeHeight,
-                                               -(height / 2.0 + flangeThickness) - holeMargin);
-            BRepAlgoAPI_Cut bottomCut(bottomFlangeDisc, bottomHole);
-            checkIsDone(bottomCut, "round bottom flange");
-
-            // Skip the Fuse: return body + flanges as a compound of 3 solids.
+            // Skip the Fuse: return tube pieces, flanges and dividers as one compound.
             // Downstream cut_bobbin can then AABB-prefilter tools per solid;
             // most turns sit in the winding window and don't intersect the
             // flange AABBs, so per-solid cuts run against far fewer tools.
             TopoDS_Compound comp;
             BRep_Builder bld;
             bld.MakeCompound(comp);
-            bld.Add(comp, body);
-            bld.Add(comp, topCut.Shape());
-            bld.Add(comp, bottomCut.Shape());
+            for (const auto& span : tubeSpans) bld.Add(comp, make_tube(span));
+            bld.Add(comp, make_flange(zHigh, flangeThickness, "round top flange"));
+            bld.Add(comp, make_flange(zLow - flangeThickness, flangeThickness, "round bottom flange"));
+            for (const auto& g : gaps) bld.Add(comp, make_flange(g.bottom, g.top - g.bottom, "round divider"));
             bobbinShape = comp;
         } else {
-            bobbinShape = body;
+            bobbinShape = make_tube(tubeSpans.front());
         }
     } else {
         // Rectangular (or irregular = EFD) column.
@@ -195,54 +220,66 @@ TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescriptio
         if (holeDepth <= 0.0) holeDepth = outerDepth * 0.8;
         double eps = wallThickness > 0 ? wallThickness * 0.1 : 1e-6;
 
-        // Rounded corners (radius = 1/4 of the smaller yoke dimension): real U/E
-        // bobbins are moulded with a corner radius on the OUTER winding surface
-        // rather than a sharp 90°. The inner bore (and the flange holes) stay
-        // SQUARE so they still match the square core central column — rounding
-        // the bore would push bobbin material into the column corners and
-        // overlap it. Only for true RECTANGULAR columns; round/oblong/irregular
-        // pass r=0 (box).
-        const bool roundCorners = (bobbin.get_column_shape() == MAS::ColumnShape::RECTANGULAR);
         // OBLONG columns get a true STADIUM tube and bore (full rounding on the short
-        // axis), matching the stadium core column; rectangular keeps the moulding
-        // radius on the outside and a square bore.
+        // axis), matching the stadium core column.
         const bool oblong = (bobbin.get_column_shape() == MAS::ColumnShape::OBLONG);
-        const double rOuter = oblong ? 0.5 * std::min(outerWidth, outerDepth)
-                              : roundCorners ? 0.25 * std::min(outerWidth, outerDepth)
-                                             : 0.0;
+        // A rectangular or irregular tube's outer corners take the radius the
+        // winding engine bends the turns around (OpenMagnetics::Bobbin::
+        // get_column_corner_radius): the record's columnCornerRadius, else half the
+        // column thickness. This used to be a quarter of the tube's smaller side,
+        // which on a thin wall cut through the wall into the bore (0.146 in against
+        // a 0.035 in wall on one E bobbin), split the tube into four slabs, and put
+        // the tube's surface away from the turns MKF winds on it. The bore stays
+        // SQUARE so it still fits the square core column: rounding it would push
+        // bobbin material into the column corners.
+        double rOuter = 0.0;
+        if (oblong) {
+            rOuter = 0.5 * std::min(outerWidth, outerDepth);
+        } else {
+            OpenMagnetics::Bobbin engineBobbin;
+            engineBobbin.set_processed_description(bobbin);
+            rOuter = engineBobbin.get_column_corner_radius();
+        }
         const double rInner = oblong ? 0.5 * std::min(holeWidth, holeDepth) : 0.0;
 
-        TopoDS_Shape outer = makeRoundedRectPrism(outerWidth, outerDepth, height, rOuter, -height / 2.0);
-        TopoDS_Shape central = makeRoundedRectPrism(holeWidth, holeDepth, height + 2.0 * eps, rInner, -height / 2.0 - eps);
-        BRepAlgoAPI_Cut bodyCut(outer, central);
-        checkIsDone(bodyCut, "rect body hollow");
+        auto make_tube = [&](const Chamber& span) -> TopoDS_Shape {
+            double h = span.top - span.bottom;
+            TopoDS_Shape outer = makeRoundedRectPrism(outerWidth, outerDepth, h, rOuter, span.bottom);
+            TopoDS_Shape central = makeRoundedRectPrism(holeWidth, holeDepth, h + 2.0 * eps, rInner, span.bottom - eps);
+            BRepAlgoAPI_Cut cut(outer, central);
+            checkIsDone(cut, "rect body hollow");
+            return cut.Shape();
+        };
 
         if (hasFlanges) {
             double flangeWidth = 2.0 * (colWidth + wwWidth);
             double flangeDepth = 2.0 * (colDepth + wwWidth);
-            double holeEps = flangeThickness * 0.1;
-            const double rFlange = roundCorners ? 0.25 * std::min(flangeWidth, flangeDepth) : 0.0;
+            // The engine has no flange corner radius. A rectangular flange keeps a
+            // quarter of its smaller side: catalogue drawings of E bobbins show
+            // rounded flanges, with no radius given.
+            const bool roundFlange = (bobbin.get_column_shape() == MAS::ColumnShape::RECTANGULAR);
+            const double rFlange = roundFlange ? 0.25 * std::min(flangeWidth, flangeDepth) : 0.0;
 
-            TopoDS_Shape topFlange = makeRoundedRectPrism(flangeWidth, flangeDepth, flangeThickness, rFlange, height / 2.0);
-            TopoDS_Shape topHole = makeRoundedRectPrism(holeWidth, holeDepth, flangeThickness + 2.0 * holeEps, rInner, height / 2.0 - holeEps);
-            BRepAlgoAPI_Cut topCut(topFlange, topHole);
-            checkIsDone(topCut, "rect top flange");
+            auto make_flange = [&](double zBottom, double thickness, const char* ctx) -> TopoDS_Shape {
+                double holeEps = thickness * 0.1;
+                TopoDS_Shape plate = makeRoundedRectPrism(flangeWidth, flangeDepth, thickness, rFlange, zBottom);
+                TopoDS_Shape hole = makeRoundedRectPrism(holeWidth, holeDepth, thickness + 2.0 * holeEps, rInner, zBottom - holeEps);
+                BRepAlgoAPI_Cut cut(plate, hole);
+                checkIsDone(cut, ctx);
+                return cut.Shape();
+            };
 
-            TopoDS_Shape bottomFlange = makeRoundedRectPrism(flangeWidth, flangeDepth, flangeThickness, rFlange, -(height / 2.0 + flangeThickness));
-            TopoDS_Shape bottomHole = makeRoundedRectPrism(holeWidth, holeDepth, flangeThickness + 2.0 * holeEps, rInner, -(height / 2.0 + flangeThickness) - holeEps);
-            BRepAlgoAPI_Cut bottomCut(bottomFlange, bottomHole);
-            checkIsDone(bottomCut, "rect bottom flange");
-
-            // Skip the Fuse: compound body + flanges as 3 solids (see round path).
+            // Skip the Fuse: compound of tube pieces, flanges and dividers (see round path).
             TopoDS_Compound comp;
             BRep_Builder bld;
             bld.MakeCompound(comp);
-            bld.Add(comp, bodyCut.Shape());
-            bld.Add(comp, topCut.Shape());
-            bld.Add(comp, bottomCut.Shape());
+            for (const auto& span : tubeSpans) bld.Add(comp, make_tube(span));
+            bld.Add(comp, make_flange(zHigh, flangeThickness, "rect top flange"));
+            bld.Add(comp, make_flange(zLow - flangeThickness, flangeThickness, "rect bottom flange"));
+            for (const auto& g : gaps) bld.Add(comp, make_flange(g.bottom, g.top - g.bottom, "rect divider"));
             bobbinShape = comp;
         } else {
-            bobbinShape = bodyCut.Shape();
+            bobbinShape = make_tube(tubeSpans.front());
         }
     }
 
