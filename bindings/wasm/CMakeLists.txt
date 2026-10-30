@@ -262,6 +262,10 @@ target_link_options(mvbpp_wasm PRIVATE
     "SHELL:-s MODULARIZE=1"
     "SHELL:-s EXPORT_NAME=createMvbpp"
     "SHELL:-s ALLOW_MEMORY_GROWTH=1"
+    # Growth stops at 2 GB unless this is raised. drawTurns on a round column needs about 14 MB
+    # per turn while it runs (16 segments; more at 32), and past the limit it dies with a bare
+    # "memory access out of bounds". 4 GB is the most a wasm32 memory can hold.
+    "SHELL:-s MAXIMUM_MEMORY=4GB"
     "SHELL:-s INITIAL_MEMORY=256MB"
     "SHELL:-s STACK_SIZE=8MB"
     # Emscripten virtual FS for /tmp writes
