@@ -3232,17 +3232,14 @@ std::vector<NamedShape> buildAllImpl(const CoilT& coil,
         const auto& ct = conductors[ci];
         const MAS::Wire& wire = wireMap.at(ct.winding);
         const MAS::WireType wireType = wire.get_type();
+        // A foil turn is a rectangle: thickness radial, strip width axial (see TurnBuilder's
+        // get_conducting_dimensions), so it takes the rectangular wire's path.
         const bool rectWire = wireType == MAS::WireType::RECTANGULAR ||
-                              wireType == MAS::WireType::PLANAR;
-        // Rectangular/planar wire: ROUND column -> one body via fixed binormal; RECT/OBLONG column
-        // or TOROID -> per-primitive rect solids fused (emitRectColumn), with the section oriented
-        // by the local bend/spacing axis (column Y, or the toroid's azimuthal tangent). Only FOIL
-        // (a single wide sheet, a different construction) still throws.
-        if (wireType == MAS::WireType::FOIL) {
-            throw std::runtime_error(
-                "ConductorBuilder: real-winding does not support FOIL wire (a single wide sheet "
-                "turn is a different construction) — winding '" + ct.winding + "'");
-        }
+                              wireType == MAS::WireType::PLANAR ||
+                              wireType == MAS::WireType::FOIL;
+        // Rectangular/planar/foil wire: ROUND column -> one body via fixed binormal; RECT/OBLONG
+        // column or TOROID -> per-primitive rect solids fused (emitRectColumn), with the section
+        // oriented by the local bend/spacing axis (column Y, or the toroid's azimuthal tangent).
         // Resolve through the first turn: turn.dimensions carries the OUTER footprint
         // (the context-less overload would fall back to the round wire's CONDUCTING
         // diameter for paintCoating=true). For rectangular wire dimensions[0]=width=RADIAL,

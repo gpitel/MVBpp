@@ -23,9 +23,8 @@ namespace mvb {
 //     conductors and the winding-window bounds, and THROWS on any overlap beyond contact;
 //     nothing is ever moved to "make it fit".
 //
-// Scope: concentric ROUND, RECTANGULAR and OBLONG columns and TOROIDS, with round/litz
-// wire. Rectangular/planar/foil wire throws (the lead cross-section orientation through
-// the exit bends is undefined until specified).
+// Scope: concentric ROUND, RECTANGULAR and OBLONG columns and TOROIDS, with round, litz,
+// rectangular, planar and foil wire. A foil turn is swept as a rectangle.
 class ConductorBuilder {
 public:
     struct Options {
