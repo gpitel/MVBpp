@@ -3,6 +3,11 @@
  *
  * Run with:  node bindings/wasm/tests/test_mvbpp.js
  * Requires:  bindings/wasm/dist/mvbpp.js  (built via `npm run build`)
+ *
+ * ABT #631: dist/ is the SHIPPED module, not necessarily the one you just built —
+ * a green run here says nothing about build-wasm/ until it has been copied over.
+ * Point the suite at a fresh build before copying:
+ *     MVBPP_WASM_JS=build-wasm/mvbpp.js node tests/test_mvbpp.js
  */
 
 'use strict';
@@ -10,7 +15,9 @@
 const fs   = require('fs');
 const path = require('path');
 
-const DIST_JS   = path.resolve(__dirname, '../dist/mvbpp.js');
+const DIST_JS   = process.env.MVBPP_WASM_JS
+    ? path.resolve(process.env.MVBPP_WASM_JS)
+    : path.resolve(__dirname, '../dist/mvbpp.js');
 const TESTS_DIR = __dirname;
 
 // ── tiny test harness ─────────────────────────────────────────────────────────
@@ -145,28 +152,36 @@ async function main() {
     // below keep exercising that default. rawDraw* keep the unwrapped handles
     // for the explicit copper-vs-coating test.
     const rawDrawMagnetic = mvbpp.drawMagnetic.bind(mvbpp);
+    // Bind BEFORE the wrappers below, or "raw" would still carry the appended paintCoating.
+    const rawDrawTurns = mvbpp.drawTurns.bind(mvbpp);
     for (const fn of ['drawMagnetic', 'drawMagneticToPath',
                       'drawTurns', 'drawTurnsToPath',
                       'drawWinding', 'drawWindingToPath']) {
         const orig = mvbpp[fn].bind(mvbpp);
         mvbpp[fn] = (...a) => orig(...a, /*paintCoating=*/true);
     }
-    // drawMagnetic / drawMagneticToPath ALSO gained two trailing real-winding arguments
+    // drawMagnetic / drawTurns (+ *ToPath) ALSO take two trailing real-winding arguments
     // (useRealWindingGeometry, femReady). They are documented as optional, but embind enforces
     // exact arity, so they must be PASSED -- undefined selects the documented default (per-turn
-    // closed loops, fast drawing compound). Without this every drawMagnetic test fails with
+    // closed loops, fast drawing compound). Without this every such test fails with
     // "called with 10 arguments, expected 12", which looks like a broken binding rather than a
-    // stale test.
-    for (const fn of ['drawMagnetic', 'drawMagneticToPath']) {
+    // stale test. rawDrawTurns (bound above) keeps the unwrapped handle for the
+    // real-winding test.
+    for (const fn of ['drawMagnetic', 'drawMagneticToPath',
+                      'drawTurns', 'drawTurnsToPath']) {
         const orig = mvbpp[fn].bind(mvbpp);
         mvbpp[fn] = (...a) => orig(...a, /*useRealWindingGeometry=*/undefined,
                                         /*femReady=*/undefined);
     }
 
-    // Use concentric_rectangular_column_one_turn.json — concentric_basic.json
-    // triggers a MKF bug (CORE_SHAPE_NOT_FOUND: EI 101/50) in the WASM build.
-    const basicJson = loadMagneticJson('concentric_rectangular_column_one_turn.json');
-    const etdJson   = loadMagneticJson('ETD49_N87_10uH_5T.json');
+    // concentric_basic.json is the BY-NAME fixture (bobbin "basic", shape "E 19/8/5"),
+    // the shape of design the frontend actually sends. It used to die in the WASM build
+    // with CORE_SHAPE_NOT_FOUND: EI 101/50 (ABT #631) and was swapped out for the
+    // fully-inline fixture, which hid the whole by-name path from these tests. Keep BOTH:
+    // the by-name one is the regression guard.
+    const basicJson    = loadMagneticJson('concentric_rectangular_column_one_turn.json');
+    const byNameJson   = loadMagneticJson('concentric_basic.json');
+    const etdJson      = loadMagneticJson('ETD49_N87_10uH_5T.json');
 
     // ── drawMagnetic ─────────────────────────────────────────────────────────
 
@@ -194,6 +209,15 @@ async function main() {
             text.includes('CLOSED_SHELL') || text.includes('ADVANCED_BREP'),
             'No solid geometry markers found in STEP output'
         );
+    });
+
+    // ABT #631: a design whose bobbin AND core shape are given BY NAME must build.
+    // This is what the frontend sends, and what the whole browser build died on.
+    test('drawMagnetic builds a by-name design (bobbin "basic", shape by name) — ABT #631', () => {
+        const result = mvbpp.drawMagnetic(byNameJson, ...NO_SIDE);
+        assert(result instanceof Uint8Array, 'Expected Uint8Array');
+        assert(result.length > 1000, `Too small: ${result.length} bytes`);
+        assert(isStepBytes(result), 'Does not start with ISO-10303-21');
     });
 
     test('ETD49 produces valid STEP', () => {
@@ -364,8 +388,9 @@ async function main() {
         assertEqual(across.length, 0, 'no face reaches from one chamber to the other');
         // No overlap and no gap: two 3.4 mm tube rings from the bore (2.3 mm) to
         // the tube (2.9 mm), and a 0.8 mm divider plus two 0.6 mm flanges from the
-        // bore to the flange (4.8 mm).
-        const ring = (outer, inner) => polygonArea(outer, 32) - polygonArea(inner, 32);
+        // bore to the flange (4.8 mm). The bore is circumscribed (its flats on the 2.3 mm
+        // circle, so faceting never bites into the core column): vertices at r / cos(pi/32).
+        const ring = (outer, inner) => polygonArea(outer, 32) - polygonArea(inner / Math.cos(Math.PI / 32), 32);
         const expected = 2 * 0.0034 * ring(0.0029, 0.0023) + (0.0008 + 2 * 0.0006) * ring(0.0048, 0.0023);
         assertClose(b.volume, expected, 1e-4 * expected, 'volume');
     });
@@ -403,6 +428,33 @@ async function main() {
         const turnsJson = JSON.stringify(j.coil.turnsDescription);
         const result = mvbpp.drawTurns(turnsJson, ...NO_SIDE);
         assert(isStepBytes(result), 'drawTurns STEP header invalid');
+    });
+
+    // drawTurns gained the real-winding form so a viewer that draws core, bobbin and
+    // turns as SEPARATE meshes can show the real copper — the single-call drawMagnetic
+    // assembly is not an option there, since each component needs its own colour and
+    // visibility toggle.
+    test('drawTurns builds real-winding conductors, and they differ from the loops', () => {
+        const ideal = rawDrawTurns(etdJson, ...NO_SIDE, true, false, false);
+        const real  = rawDrawTurns(etdJson, ...NO_SIDE, true, true,  false);
+        assert(isStepBytes(ideal), 'ideal drawTurns STEP header invalid');
+        assert(isStepBytes(real), 'real-winding drawTurns STEP header invalid');
+        assert(real.length > 1000, `real-winding turns too small: ${real.length}`);
+        // One continuous body per (winding, parallel) vs one closed loop per turn is a
+        // different topology; identical bytes would mean the flag did nothing.
+        assert(real.length !== ideal.length,
+               'real-winding turns are byte-identical to the idealised ones');
+    });
+
+    test('drawTurns real winding refuses a bare turns array instead of silently idealising', () => {
+        const enriched = mvbpp._enrichMagnetic(basicJson);
+        const turnsJson = JSON.stringify(JSON.parse(enriched).coil.turnsDescription);
+        let threw = null;
+        try { rawDrawTurns(turnsJson, ...NO_SIDE, true, true, false); }
+        catch (e) { threw = String(e.message || e); }
+        assert(threw !== null, 'expected a refusal for a bare turnsDescription array');
+        assert(/useRealWindingGeometry/.test(threw),
+               `error should name the flag, got: ${threw}`);
     });
 
     // ── drawWinding ──────────────────────────────────────────────────────────
@@ -501,6 +553,22 @@ async function main() {
             threw = true;
         }
         assert(threw, 'Expected exception for invalid side');
+    });
+
+    // ── mesher ────────────────────────────────────────────────────────────────
+
+    console.log('\nmvbpp WASM — mesher');
+    console.log('─'.repeat(50));
+
+    test('meshBuildRevision reports the linked gmsh fork and MMG', () => {
+        const rev = JSON.parse(mvbpp.meshBuildRevision());
+        // gmsh answers this itself at run time: the fork's om-4.15.2 build, not a checkout.
+        // The commit is abbreviated as git chooses (7 in a fresh clone, more in a big repo).
+        assert(/^4\.15\.2-git-[0-9a-f]{7,40}$/.test(rev.gmsh), `gmsh version: ${rev.gmsh}`);
+        assert(!/\bMetis\b/.test(rev.gmshBuildOptions), `gmsh built with Metis: ${rev.gmshBuildOptions}`);
+        assert(rev.mmg === '5.8.0', `mmg version: ${rev.mmg}`);
+        for (const k of ['mvbpp', 'mkf', 'mas'])
+            assert(/^[0-9a-f]{40}(-dirty)?$/.test(rev[k]), `${k} revision: ${rev[k]}`);
     });
 
     // ── error handling ────────────────────────────────────────────────────────

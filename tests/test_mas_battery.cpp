@@ -383,7 +383,14 @@ CaseResult run_one(const fs::path& path) {
         fail("autocomplete left geometricalDescription empty");
         return r;
     }
-    const size_t expectedPieces = gd->size();
+    // ABT #1170: a geometricalDescription also lists the SPACER elements of an additive gap.
+    // Those are not core pieces -- buildCoreNamed draws only the pieces, and the shims arrive
+    // through the accessory hook as Spacer_<i> -- so they are excluded from the expected count.
+    // (No fixture had an additive gap before additive_gap_e_core.json, so the count never saw one.)
+    const size_t expectedPieces = static_cast<size_t>(std::count_if(gd->begin(), gd->end(),
+        [](const MAS::CoreGeometricalDescriptionElement& element) {
+            return element.get_type() != MAS::CoreGeometricalDescriptionElementType::SPACER;
+        }));
 
     // -- 3. Build core / bobbin / turns ------------------------------------
     mvb::MagneticBuilder builder;
@@ -844,8 +851,20 @@ static BatteryChildMode batteryChildModeHook;
 // failure (returns "UNRECOGNISED") so a new fault mode cannot hide.
 const char* realwinding_category(const std::string& msg) {
     if (msg.find("collision between") != std::string::npos)        return "collision (ABT #240/#187)";
+    if (msg.find("no clear terminal-lead route") != std::string::npos)
+        return "no lead corridor (ABT #187)";   // routed-lead validation: layout reserves none
+    if (msg.find("NO outer-crossing azimuth exists") != std::string::npos)
+        return "no lead corridor (ABT #187)";   // MKF's chord-aware sweep exhausted in-section
     if (msg.find("FOIL wire") != std::string::npos ||
         msg.find("rectangular/planar/foil wire") != std::string::npos) return "foil wire (unsupported)";
+    // PLANAR (PCB) construction: MKF has no real-winding model for it (ABT #492 -- leads,
+    // connection blocking and lead routing are for wound magnetics only). A declared limitation
+    // like the foil case above, not an untriaged fault: refusing is the correct behaviour and the
+    // battery should categorise it rather than fail. Alf, 2026-08-26: "09_planar should be
+    // avoided, we are not implementing planar real windings YET." Drop this matcher the day
+    // planar real winding lands, so the fixture goes back to being a real failure if it breaks.
+    if (msg.find("PLANAR (PCB) construction") != std::string::npos)
+        return "planar real winding (not implemented, ABT #492)";
     if (msg.find("produced 0 turns") != std::string::npos)         return "MKF 0 turns (doesn't fit window)";
     if (msg.find("unsupported column shape") != std::string::npos) return "unsupported column shape";
     if (msg.find("single-body sweep failed") != std::string::npos) return "rect-wire sweep (unsupported)";

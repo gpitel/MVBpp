@@ -1,34 +1,69 @@
 // Real-winding geometry ([realwinding]): ONE continuous conductor per (winding, parallel)
 // replacing the per-turn closed loops, with every MKF turn position honoured exactly.
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/catch_approx.hpp>
+#include <filesystem>
+#include <set>
+#include <functional>
 #include <catch2/matchers/catch_matchers_string.hpp>
 #include "mvb/MagneticBuilder.h"
 #include "mvb/Utils.h"
+#include "mvb/StepExporter.h"
 #include "constructive_models/Magnetic.h"
 #include "json.hpp"
+#include "support/Settings.h"
+#include <BRepBuilderAPI_Transform.hxx>
 #include <BRepAlgoAPI_Common.hxx>
 #include <BRepClass3d_SolidClassifier.hxx>
 #include <BRepPrimAPI_MakeTorus.hxx>
+#include <BRepPrimAPI_MakeBox.hxx>
+#include <BRep_Builder.hxx>
+#include <TopoDS_Solid.hxx>
+#include <TopoDS_Shell.hxx>
 #include <BRepBuilderAPI_MakeEdge.hxx>
 #include <BRepBuilderAPI_MakeVertex.hxx>
 #include <TopoDS_Vertex.hxx>
 #include <BRepExtrema_DistShapeShape.hxx>
+#include <Bnd_Box.hxx>
+#include <BRepTools.hxx>
+#include <BRepBndLib.hxx>
 #include <BRepCheck_Analyzer.hxx>
 #include <BRepAdaptor_Surface.hxx>
+#include <BRepAdaptor_Curve.hxx>
 #include <GeomAbs_SurfaceType.hxx>
+#include <GeomAbs_CurveType.hxx>
+#include <TopExp.hxx>
+#include <TopTools_IndexedMapOfShape.hxx>
 #include <TopoDS_Edge.hxx>
 #include <gp_Ax2.hxx>
 #include <gp_Circ.hxx>
+#include <gp_Torus.hxx>
+#include "mvb/WireAssembler.h"
+#include "mvb/PortPlane.h"
+#include "mvb/NamedShape.h"
 #include <gp_Dir.hxx>
 #include <BRepGProp.hxx>
 #include <GProp_GProps.hxx>
 #include <BOPAlgo_CheckerSI.hxx>
+#include <BOPAlgo_ArgumentAnalyzer.hxx>
+#include <BRep_Tool.hxx>
+#include <Precision.hxx>
+#include <Geom_Surface.hxx>
+#include <GeomAPI_ExtremaCurveCurve.hxx>
+#include <Geom_Line.hxx>
 #include <TopTools_ListOfShape.hxx>
 #include <TopExp_Explorer.hxx>
 #include <TopoDS.hxx>
 #include <gp_Pnt.hxx>
 #include <cmath>
+#include <array>
+#include <cstdlib>
+#include <limits>
+#include <map>
+#include <string>
+#include <memory>
 #include <fstream>
+#include <sstream>
 #include <numbers>
 #include <variant>
 
@@ -36,9 +71,21 @@ using json = nlohmann::json;
 
 namespace {
 
+// Every artifact a test writes goes to <repo>/output, never the working directory: run from the
+// build tree or the repo root, the STEPs land in one place and the project root stays clean
+// (Alf, 2026-08-14: "can you clean the root of the project and just put all generated files in
+// output?"). The path is derived from THIS source file, so it does not depend on the CWD.
+std::string outputPath(const std::string& name) {
+    const auto dir = std::filesystem::path{__FILE__}.parent_path().parent_path() / "output";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    return (dir / name).string();
+}
+
 json loadFixture(const std::string& name) {
     std::ifstream f("testData/" + name);
     if (!f.good()) f = std::ifstream("tests/realwinding_fixtures/" + name);
+    if (!f.good()) f = std::ifstream("tests/mas_complete_fixtures/" + name);
     REQUIRE(f.good());
     json j = json::parse(f);
     return j.contains("magnetic") ? j.at("magnetic") : j;
@@ -56,6 +103,99 @@ int solidCount(const TopoDS_Shape& s) {
     return n;
 }
 
+// CONNECTED components among a shape's solids: two solids connect when they touch or
+// overlap (BRepExtrema distance ~ 0). This -- not solidCount == 1 -- is the actual FEM
+// requirement: the meshing fragment welds touching/overlapping same-region solids into one
+// conformal region, so a compound whose pieces all touch meshes as ONE winding. Demanding a
+// single BREP solid was retired 2026-08: the whole-spine single-body sweep that produced it
+// folds onto itself at junctions (measured: 3.7 um between adjacent patches at ETD34's
+// wrap->lead fillet; 4.7 um at every e138 racetrack corner), which NO element size can
+// discretise, while welded/touching exact pieces mesh cleanly (ETD34: 3.66M tets, READY).
+// A DISCONNECTED conductor is still rejected -- that was the original point of the check.
+int connectedSolidComponents(const TopoDS_Shape& s) {
+    std::vector<TopoDS_Shape> solids;
+    for (TopExp_Explorer e(s, TopAbs_SOLID); e.More(); e.Next()) solids.push_back(e.Current());
+    if (solids.size() <= 1) return (int)solids.size();
+    std::vector<int> parent(solids.size());
+    for (size_t i = 0; i < parent.size(); ++i) parent[i] = (int)i;
+    std::function<int(int)> find = [&](int a) { while (parent[a] != a) a = parent[a] = parent[parent[a]]; return a; };
+    // Bounding-box prefilter: all-pairs BRepExtrema on a ~150-solid conformal compound is ~11k
+    // exact distance queries (~1 h); boxes farther apart than the touch tolerance can never touch.
+    std::vector<Bnd_Box> boxes(solids.size());
+    for (size_t i = 0; i < solids.size(); ++i) BRepBndLib::Add(solids[i], boxes[i]);
+    for (size_t i = 0; i < solids.size(); ++i)
+        for (size_t j = i + 1; j < solids.size(); ++j) {
+            if (find((int)i) == find((int)j)) continue;
+            if (boxes[i].Distance(boxes[j]) > 1e-6) continue;
+            BRepExtrema_DistShapeShape d(solids[i], solids[j]);
+            if (d.IsDone() && d.Value() < 1e-6) parent[find((int)i)] = find((int)j);
+        }
+    std::set<int> roots;
+    for (size_t i = 0; i < solids.size(); ++i) roots.insert(find((int)i));
+    return (int)roots.size();
+}
+
+bool pointStrictlyInsideShape(const TopoDS_Shape& shape, const gp_Pnt& p);
+
+// The femReady round-wire conductor contract: a CONFORMAL mitre compound. One connected chain,
+// every solid individually valid (BRepCheck), and consecutive solids abut WITHOUT volumetric
+// overlap (their contact is coincident faces, which the meshing fragment welds conformally).
+// Interpenetration is checked by CLASSIFYING A GRID over the junction region (the bbox
+// intersection), NOT with BRepAlgoAPI_Common: OCC booleans on abutting BSpline pipe solids are
+// the documented pathological input class this architecture exists to avoid, and Common ground
+// for >10 min PER PAIR in 2d-extrema root-finding on the toroid's hole-threading pipes
+// (measured via gdb backtrace). A point strictly inside BOTH neighbours = real overlap; the
+// historical per-run compound overlaps (~0.5-1 mm^3 per joint) light up dozens of grid points.
+void requireConformalConductor(const TopoDS_Shape& shape) {
+    std::vector<TopoDS_Shape> solids;
+    for (TopExp_Explorer e(shape, TopAbs_SOLID); e.More(); e.Next()) solids.push_back(e.Current());
+    REQUIRE(!solids.empty());
+    REQUIRE(connectedSolidComponents(shape) == 1);
+    for (const auto& s : solids) REQUIRE(BRepCheck_Analyzer(s).IsValid());
+    int stride = std::max<int>(1, static_cast<int>(solids.size()) / 15);
+    for (size_t i = 0; i + 1 < solids.size(); i += static_cast<size_t>(stride)) {
+        Bnd_Box ba, bb;
+        BRepBndLib::Add(solids[i], ba);
+        BRepBndLib::Add(solids[i + 1], bb);
+        double ax0, ay0, az0, ax1, ay1, az1, bx0, by0, bz0, bx1, by1, bz1;
+        ba.Get(ax0, ay0, az0, ax1, ay1, az1);
+        bb.Get(bx0, by0, bz0, bx1, by1, bz1);
+        const double x0 = std::max(ax0, bx0), x1 = std::min(ax1, bx1);
+        const double y0 = std::max(ay0, by0), y1 = std::min(ay1, by1);
+        const double z0 = std::max(az0, bz0), z1 = std::min(az1, bz1);
+        if (x0 >= x1 || y0 >= y1 || z0 >= z1) continue;   // disjoint boxes: nothing to probe
+        constexpr int N = 6;
+        int inBoth = 0;
+        gp_Pnt firstHit;
+        for (int gx = 0; gx < N; ++gx)
+            for (int gy = 0; gy < N; ++gy)
+                for (int gz = 0; gz < N; ++gz) {
+                    const gp_Pnt p(x0 + (x1 - x0) * (gx + 0.5) / N,
+                                   y0 + (y1 - y0) * (gy + 0.5) / N,
+                                   z0 + (z1 - z0) * (gz + 0.5) / N);
+                    if (pointStrictlyInsideShape(solids[i], p) && pointStrictlyInsideShape(solids[i + 1], p)) {
+                        if (inBoth == 0) firstHit = p;
+                        ++inBoth;
+                    }
+                }
+        GProp_GProps gpa, gpb;
+        BRepGProp::VolumeProperties(solids[i], gpa);
+        BRepGProp::VolumeProperties(solids[i + 1], gpb);
+        if (inBoth > 0) {   // offline forensics (CWD): the exact solids the probe flagged
+            BRepTools::Write(solids[i], ("mitre_overlap_A_" + std::to_string(i) + ".brep").c_str());
+            BRepTools::Write(solids[i + 1], ("mitre_overlap_B_" + std::to_string(i + 1) + ".brep").c_str());
+        }
+        INFO("mitre neighbours [" << i << "," << (i + 1) << "]: " << inBoth
+             << " junction-grid points inside BOTH solids (first at ("
+             << firstHit.X() << "," << firstHit.Y() << "," << firstHit.Z() << ")); A centroid=("
+             << gpa.CentreOfMass().X() << "," << gpa.CentreOfMass().Y() << ","
+             << gpa.CentreOfMass().Z() << ") vol=" << gpa.Mass() << "; B centroid=("
+             << gpb.CentreOfMass().X() << "," << gpb.CentreOfMass().Y() << ","
+             << gpb.CentreOfMass().Z() << ") vol=" << gpb.Mass());
+        REQUIRE(inBoth == 0);
+    }
+}
+
 double shapeVolume(const TopoDS_Shape& s) {
     GProp_GProps props;
     BRepGProp::VolumeProperties(s, props);
@@ -64,14 +204,31 @@ double shapeVolume(const TopoDS_Shape& s) {
 
 double commonVolume(const TopoDS_Shape& a, const TopoDS_Shape& b) {
     BRepAlgoAPI_Common common(a, b);
-    if (!common.IsDone()) return -1.0;
+    // A boolean that cannot run is NOT evidence of zero overlap: returning -1 here made
+    // every 'overlap <= tol' assertion pass vacuously whenever OCC choked on the operands
+    // (exact-quadric cylinder pairs do exactly that). Return a loud sentinel that fails
+    // any sane tolerance instead.
+    if (!common.IsDone()) return 1e9;
     return shapeVolume(common.Shape());
 }
+
 
 bool pointInsideShape(const TopoDS_Shape& shape, const gp_Pnt& p, double tol = 1e-9) {
     for (TopExp_Explorer exp(shape, TopAbs_SOLID); exp.More(); exp.Next()) {
         BRepClass3d_SolidClassifier cls(TopoDS::Solid(exp.Current()), p, tol);
         if (cls.State() == TopAbs_IN || cls.State() == TopAbs_ON) return true;
+    }
+    return false;
+}
+
+// STRICT interior (TopAbs_IN only): the conformal junction probe must NOT count TopAbs_ON --
+// points on the coincident abutment faces of a tangent mitre junction classify ON for BOTH
+// neighbours (that contact IS the conformal design), and counting them read as interpenetration
+// (16/216 false hits on the 12-turn toroid; a 24^3 strict-IN census of the same pair found 0).
+bool pointStrictlyInsideShape(const TopoDS_Shape& shape, const gp_Pnt& p) {
+    for (TopExp_Explorer exp(shape, TopAbs_SOLID); exp.More(); exp.Next()) {
+        BRepClass3d_SolidClassifier cls(TopoDS::Solid(exp.Current()), p, 1e-9);
+        if (cls.State() == TopAbs_IN) return true;
     }
     return false;
 }
@@ -100,13 +257,54 @@ double coreFacetWedgeBound(double wireRadius, double borderRadius, int coreSegme
 // All-pairs boolean interference among named bodies (skipping the bobbin, which is
 // deliberately cut to yield). Tolerance covers polygon-facet slivers of the cores.
 void requireNoPairwiseOverlap(const std::vector<mvb::NamedShape>& named, double tol) {
+    // Decompose every body into its solids once (with bboxes) and run booleans only on solid
+    // pairs whose boxes actually come near: Common on whole CONFORMAL COMPOUNDS (~150 solids
+    // since the femReady mitre default) took tens of minutes per pair and timed out the suite;
+    // near-pair pruning keeps the check exact while touching only real contacts.
+    struct Body {
+        std::vector<TopoDS_Shape> solids;
+        std::vector<Bnd_Box> boxes;
+    };
+    std::vector<Body> bodies(named.size());
+    for (size_t i = 0; i < named.size(); ++i)
+        for (TopExp_Explorer e(named[i].shape, TopAbs_SOLID); e.More(); e.Next()) {
+            Bnd_Box bb;
+            BRepBndLib::Add(e.Current(), bb);
+            bodies[i].solids.push_back(e.Current());
+            bodies[i].boxes.push_back(bb);
+        }
     for (size_t i = 0; i < named.size(); ++i) {
         if (named[i].name.find("Bobbin") != std::string::npos) continue;
         for (size_t j = i + 1; j < named.size(); ++j) {
             if (named[j].name.find("Bobbin") != std::string::npos) continue;
-            double v = commonVolume(named[i].shape, named[j].shape);
+            double v = 0.0;
+            std::string verify;
+            for (size_t a = 0; a < bodies[i].solids.size(); ++a)
+                for (size_t b = 0; b < bodies[j].solids.size(); ++b) {
+                    if (bodies[i].boxes[a].Distance(bodies[j].boxes[b]) > 1e-9) continue;
+                    double vv = commonVolume(bodies[i].solids[a], bodies[j].solids[b]);
+                    // Second opinion WITHOUT booleans: classify the common region's centroid in
+                    // both bodies. OCC booleans on quadric pairs have been caught returning
+                    // "empty" for genuinely overlapping solids (and fabricating the reverse), so
+                    // an interference verdict must not rest on one algorithm.
+                    if (vv > tol && vv < 1e8) {
+                        BRepAlgoAPI_Common common(bodies[i].solids[a], bodies[j].solids[b]);
+                        if (common.IsDone()) {
+                            GProp_GProps gp_;
+                            BRepGProp::VolumeProperties(common.Shape(), gp_);
+                            const gp_Pnt c = gp_.CentreOfMass();
+                            const bool inA = pointInsideShape(bodies[i].solids[a], c);
+                            const bool inB = pointInsideShape(bodies[j].solids[b], c);
+                            verify += std::string(" [") + std::to_string(a) + "," +
+                                      std::to_string(b) + " centroid-in-A=" + (inA ? "yes" : "no") +
+                                      " centroid-in-B=" + (inB ? "yes" : "no") + "]";
+                            if (!(inA && inB)) vv = 0.0;   // boolean fabricated the overlap
+                        }
+                    }
+                    v += vv;
+                }
             INFO("pairwise overlap '" << named[i].name << "' vs '" << named[j].name
-                                      << "' = " << v);
+                                      << "' = " << v << verify);
             REQUIRE(v <= tol);
         }
     }
@@ -122,6 +320,54 @@ void requireNoPairwiseOverlap(const std::vector<mvb::NamedShape>& named, double 
 // value the union left invalid seams, BRepCheck rejected it, and the builder SILENTLY
 // returned a compound of disconnected per-turn solids — geometry that names and volumes
 // alone cannot distinguish from the real thing, and that gmsh cannot mesh at all.
+// ABT #615 / Alf (custom_magnetic 37, 2026-08-21): AN INTER-SECTION CONNECTION MUST HAVE A WAY
+// OUT OF ITS OWN SECTION.
+//
+// E 16/6/5, Primary 22t x 2p interleaved. Primary section 0 is the FULL window height (6.5 mm)
+// and its single layer is completely full: parallel 0 holds y = -3.094..-0.163 mm and parallel 1
+// holds +0.163..+3.094, 20 turns at a 0.326 mm pitch. Parallel 0's last turn therefore sits in
+// the MIDDLE of the stack, at the boundary with its sibling.
+//
+// MKF then routes that turn to the next section on an inter-section BAND at a window edge, choosing
+// the edge with `exitTurn.y >= windowCentre`. At -0.163 that reads "below centre" and sends the band
+// to the BOTTOM, so the wire must descend 1.58 mm back through its own turns 4..8 -- and by ABT
+// #615's own rule a continuation reserves nothing in its own section, so nothing is blocked out of
+// its way. The 3D gate refuses it as a hard bare-copper collision, correctly.
+//
+// There is no good edge: down crosses parallel 0's turns, up crosses parallel 1's. The section is
+// full, so both are copper. The defect is that the layout does not pay for the escape at all --
+// MKF reports the wind as fitting, then hands over a route that cannot be drawn. Fixing the edge
+// choice alone is NOT enough (measured: it moves the failure to parallel 1); either the band must
+// sit at the exit turn's own row, or a full section owing an inter-section exit must be one turn
+// over capacity and refused.
+//
+// This test pins the CONTRACT: a design MKF accepts must be buildable. It was written failing
+// ([!shouldfail]) and flipped on 2026-08-22 when the design first built CERTIFIED CLEAR (0 nm,
+// every pair proven). What it took, in order (ABT #849): MKF's N-filar law (placement f5cb139f +
+// distribution 1f897b5c) so every layer holds all parallels side by side and the exit turn is at
+// the layer's end, not mid-stack; whole-winding parallel-order continuity (c318b004, kept through
+// the L-shape revert 90c253bf); and on the MVB++ side the band chain riding one OD off the
+// destination face (b16b2ff), the chain ending where the next wrap begins (no 180-degree fold at
+// the crossing), and EXIT LANES -- parallels leave side by side on the +X face, the last wrap
+// ending at its lane, the stub one OD off the face (Alf: 'as parallels they should be going out
+// side by side'). Any regression in that chain shows here as the gate's own refusal.
+TEST_CASE("Real winding: an interleaved N-filar design builds CERTIFIED CLEAR (cm37)",
+          "[realwinding][connectivity][abt615][abt849]") {
+    auto magneticJson = loadFixture("realwinding_interleaved_full_section_e16.json");
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+
+    mvb::MagneticBuilder builder;
+    // EXACTLY the CLI's path and config (mvbpp_step_generator --real), because that is where the
+    // defect shows: buildAllNamed with polygonSegments=0 builds this design without complaint,
+    // so a test written against it would have reported the bug fixed while the tool still refused.
+    mvb::DrawConfig cfg{"step", /*includeBobbin=*/true, /*scale=*/1.0, /*symmetryPlanes=*/0};
+    cfg.useRealWindingGeometry = true;
+    cfg.paintCoating = true;
+    // The gate is the assertion: it throws on any bare-copper overlap, so a clean build IS the
+    // contract. Nothing is relaxed here -- see ABT #839, the gate is never weakened to pass.
+    REQUIRE_NOTHROW(builder.drawMagnetic(enriched, outputPath(""), cfg));
+}
+
 TEST_CASE("Real winding: rect-column conductor fuses into ONE connected solid",
           "[realwinding][connectivity]") {
     auto magneticJson = loadFixture("realwinding_e138_rectcolumn.json");  // E 13/7/4, 6 turns, 0.4 mm round
@@ -145,9 +391,145 @@ TEST_CASE("Real winding: rect-column conductor fuses into ONE connected solid",
         INFO("conductor: " << ns.name << "  solids=" << solidCount(ns.shape));
         REQUIRE(!ns.shape.IsNull());
         REQUIRE(shapeVolume(ns.shape) > 0.0);
-        REQUIRE(solidCount(ns.shape) == 1);   // the check that was missing
+        // ONE CONNECTED conductor (see connectedSolidComponents): welded/touching exact
+        // pieces are FEM-equivalent to one solid; only DISCONNECTION is a failure.
+        REQUIRE(connectedSolidComponents(ns.shape) == 1);
     }
     REQUIRE(conductors > 0);
+}
+
+// The web case Alf hit on 2026-08-13 (E 16/8/8, 19 turns of litz 31x0.1, 3 stacks, U winding
+// order and ~2.92 mm of margin tape at the top). U alone built, margin alone built, and the two
+// together died in ConductorBuilder with the entrance lead running through a turn's wrap — the
+// 3D view showed a core and a bobbin with no copper at all (MKF ABT #682: the overflowing layer
+// was centred on a span it did not fit and landed on the lead's own row; it now gives back the
+// deeper reservation instead). Kept as a fixture because it is the combination, not either half,
+// that regressed: a design carrying BOTH is the only thing that would have caught it.
+// TEMP sweep: every MAS example through the real-winding builder, checked for what a mesh needs
+// — every solid valid (BRepCheck), ONE connected component per conductor, and no volumetric
+// interpenetration at the junctions.
+TEST_CASE("Tmp mesh sweep", "[meshsweep]") {
+    namespace fs = std::filesystem;
+    std::vector<fs::path> files;
+    for (const auto& e : fs::directory_iterator(MAS_EXAMPLES_DIR)) {
+        if (e.path().extension() == ".json" && std::isdigit(e.path().filename().string()[0])) {
+            files.push_back(e.path());
+        }
+    }
+    std::sort(files.begin(), files.end());
+    for (const auto& f : files) {
+        std::ifstream in(f.string());
+        json j = json::parse(in);
+        json magneticJson = j.contains("magnetic") ? j.at("magnetic") : j;
+        std::string name = f.filename().string();
+        try {
+            auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, true);
+            mvb::MagneticBuilder builder;
+            auto named = builder.buildAllNamed(enriched, false, 0,
+                                               mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
+                                               mvb::DEFAULT_CORE_POLYGON_SEGMENTS, true, false,
+                                               false, 0.0, true, true);
+            int conductors = 0, bad = 0;
+            std::string why;
+            for (const auto& ns : named) {
+                if (ns.name.find(" parallel ") == std::string::npos) continue;
+                std::vector<TopoDS_Shape> solids;
+                if (!ns.shape.IsNull())
+                    for (TopExp_Explorer e(ns.shape, TopAbs_SOLID); e.More(); e.Next())
+                        solids.push_back(e.Current());
+                if (solids.empty()) continue;   // coating shells / empty helpers, not the copper
+                ++conductors;
+                if (connectedSolidComponents(ns.shape) != 1) { ++bad; why += " disconnected"; }
+                for (const auto& sol : solids)
+                    if (!BRepCheck_Analyzer(sol).IsValid()) { ++bad; why += " invalid"; break; }
+            }
+            std::cout << "[mesh] " << name << " conductors=" << conductors
+                      << (bad == 0 ? "  OK (valid, connected)" : ("  PROBLEM:" + why)) << std::endl;
+        }
+        catch (const std::exception& e) {
+            std::cout << "[mesh] " << name << "  THREW: " << std::string(e.what()).substr(0, 90) << std::endl;
+        }
+    }
+}
+
+TEST_CASE("Real winding: U order with margin tape builds a continuous conductor",
+          "[realwinding][abt682]") {
+    auto magneticJson = loadFixture("realwinding_u_order_margin_e16.json");
+    // The fixture is the design as the web hands it over: already wound, U on the bobbin's
+    // winding window, margin on the section.
+    REQUIRE(magneticJson.at("coil").at("bobbin").at("processedDescription")
+                        .at("windingWindows").at(0).at("windingOrder") == "U");
+
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+
+    mvb::MagneticBuilder builder;
+    auto named = builder.buildAllNamed(enriched, /*includeBobbin=*/true, /*symmetryPlanes=*/0,
+                                       mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
+                                       mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
+                                       /*paintCoating=*/true, /*emitCoatingShells=*/false,
+                                       /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
+                                       /*useRealWindingGeometry=*/true, /*femReady=*/true);
+
+    // The layers must connect HORIZONTALLY (MKF ABT #683): U exists so the next layer starts
+    // level with the turn it connects to. Read it off the geometry MVB++ actually builds from.
+    {
+        auto& enrichedCoil = enriched.get_mutable_coil();
+        auto enrichedTurnsOptional = enrichedCoil.get_turns_description();
+        REQUIRE(enrichedTurnsOptional);
+        const auto& enrichedTurns = enrichedTurnsOptional.value();
+        std::vector<std::string> layerOrder;
+        std::map<std::string, std::vector<double>> heightsPerLayer;
+        for (const auto& turn : enrichedTurns) {
+            if (!turn.get_layer()) continue;
+            const std::string layerName = turn.get_layer().value();   // BY VALUE: the optional comes back by value, so .value() would dangle
+            if (!heightsPerLayer.count(layerName)) layerOrder.push_back(layerName);
+            heightsPerLayer[layerName].push_back(turn.get_coordinates()[1]);
+        }
+        REQUIRE(layerOrder.size() >= 2);
+        for (size_t i = 0; i + 1 < layerOrder.size(); ++i) {
+            double arrival = heightsPerLayer[layerOrder[i]].back();
+            double landing = heightsPerLayer[layerOrder[i + 1]].front();
+            INFO(layerOrder[i] << " leaves at " << arrival * 1000 << " mm, "
+                 << layerOrder[i + 1] << " starts at " << landing * 1000 << " mm");
+            CHECK(std::abs(arrival - landing) < 0.0002);
+        }
+    }
+
+    const mvb::NamedShape* conductor = nullptr;
+    for (const auto& ns : named) {
+        if (ns.name == "Primary parallel 0") {
+            REQUIRE(conductor == nullptr);
+            conductor = &ns;
+        }
+    }
+    REQUIRE(conductor != nullptr);
+    REQUIRE(!conductor->shape.IsNull());
+    REQUIRE(shapeVolume(conductor->shape) > 0.0);
+    REQUIRE(connectedSolidComponents(conductor->shape) == 1);
+
+    // The margin is geometry, not decoration (MKF ABT #676): no copper above the tape's inner
+    // face. Read the face from the design rather than hard-coding it, so the fixture stays the
+    // source of truth.
+    const auto& window = magneticJson.at("coil").at("bobbin").at("processedDescription")
+                                     .at("windingWindows").at(0);
+    const double windowTop = window.at("coordinates").at(1).get<double>()
+                           + window.at("height").get<double>() / 2;
+    double margin = 0.0;
+    for (const auto& section : magneticJson.at("coil").at("sectionsDescription")) {
+        if (section.at("type") != "conduction" || !section.contains("margin")) continue;
+        const auto& m = section.at("margin");
+        margin = std::max(margin, m.is_array() ? m.at(0).get<double>()
+                                               : m.at("topOrLeftWidth").get<double>());
+    }
+    REQUIRE(margin > 0.0);
+    Bnd_Box box;
+    BRepBndLib::Add(conductor->shape, box);
+    double xMin, yMin, zMin, xMax, yMax, zMax;
+    box.Get(xMin, yMin, zMin, xMax, yMax, zMax);
+    // Bounding box is in mm; a faceting tolerance of one polygon sagitta is expected on round wire.
+    INFO("copper top " << yMax << " mm against the margin's inner face "
+                       << (windowTop - margin) * 1000 << " mm");
+    REQUIRE(yMax <= (windowTop - margin) * 1000 + 0.05);
 }
 
 TEST_CASE("Real winding: single-parallel PQ33 becomes one continuous conductor",
@@ -176,8 +558,10 @@ TEST_CASE("Real winding: single-parallel PQ33 becomes one continuous conductor",
     REQUIRE(conductor != nullptr);
     REQUIRE(!conductor->shape.IsNull());
     REQUIRE(shapeVolume(conductor->shape) > 0.0);
-    // CONNECTIVITY: exactly one solid — a continuous conductor, not a bag of loose turns.
-    REQUIRE(solidCount(conductor->shape) == 1);
+    // CONNECTIVITY: one connected component — a continuous conductor, not a bag of loose
+    // turns. Touching/overlapping pieces count as connected (the meshing fragment welds
+    // them into one conformal region); see connectedSolidComponents.
+    REQUIRE(connectedSolidComponents(conductor->shape) == 1);
 
     // The "nothing moves" regression guard: every MKF turn station lies INSIDE the
     // conductor's copper. Helical wraps pass the exact station at their start phase, so
@@ -272,23 +656,39 @@ TEST_CASE("Real winding: two parallels become two independent conductors", "[rea
     }
 }
 
-TEST_CASE("Real winding: multi-parallel throws on MKF's overlapping lead rows",
+TEST_CASE("Real winding: multi-layer multi-parallel builds collision-free",
           "[realwinding]") {
-    // MKF draws every parallel's terminal lead at the SAME edge row (identical rectangles), so a
-    // multi-parallel winding's parallel strands have COINCIDENT lead copper. That is overlapping
-    // copper — an un-meshable solid — even though the parallels are the same net, so the collision gate
-    // (which forbids ANY copper interpenetration, parallels included) correctly refuses to emit it. The
-    // per-winding seam stagger cannot separate them: parallels share a winding, hence the same angle.
-    // MKF must allocate one lead row per parallel (ABT #229/#240) before this can build.
-    auto magneticJson = loadFixture("realwinding_round_2p.json");   // 8t x 2p -> multi-layer
+    // HISTORY — this fixture characterized two generations of a collision, both fixed. First MKF
+    // drew every parallel's terminal lead at the SAME edge row (coincident copper) until ABT
+    // #229/#240 gave each parallel its own row. The build then still collided: the U layer links
+    // landed LEVEL with the previous layer's last turn, so the parallels' landing revolutions
+    // overlapped. The ABT #608 final form fixed that too — MKF places each non-first U layer's
+    // first station below the tangential arrival (as far as the window allows) and the landing
+    // wrap descends, chunk included — so the 8t x 2p multi-layer U fixture now builds valid,
+    // meshable copper (verified ALL WATERTIGHT in the full battery). The gate throwing here again
+    // means a REGRESSION in one of those two fixes.
+    auto magneticJson = loadFixture("realwinding_round_2p.json");   // 8t x 2p -> multi-layer U
     auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, true);
 
     mvb::MagneticBuilder builder;
-    REQUIRE_THROWS_WITH(
-        builder.buildAllNamed(enriched, true, 0, mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
-                              mvb::DEFAULT_CORE_POLYGON_SEGMENTS, true, false, false, 0.0,
-                              /*useRealWindingGeometry=*/true),
-        Catch::Matchers::ContainsSubstring("collision"));
+    auto named = builder.buildAllNamed(enriched, true, 0, mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
+                                       mvb::DEFAULT_CORE_POLYGON_SEGMENTS, true, false, false, 0.0,
+                                       /*useRealWindingGeometry=*/true);
+
+    const mvb::NamedShape* p0 = nullptr;
+    const mvb::NamedShape* p1 = nullptr;
+    for (const auto& ns : named) {
+        if (ns.name == "Primary parallel 0") p0 = &ns;
+        if (ns.name == "Primary parallel 1") p1 = &ns;
+    }
+    REQUIRE(p0 != nullptr);
+    REQUIRE(p1 != nullptr);
+    REQUIRE(shapeVolume(p0->shape) > 0.0);
+    REQUIRE(shapeVolume(p1->shape) > 0.0);
+    // Same guarantee the single-layer 2p case asserts: the parallels are independent copper.
+    double v = commonVolume(p0->shape, p1->shape);
+    INFO("parallel-parallel common volume = " << v);
+    REQUIRE(v <= 1e-12);
 }
 
 namespace {
@@ -328,9 +728,22 @@ void requireCrossingOnCenterline(const TopoDS_Shape& conductor, const gp_Pnt& cr
     INFO(what << " at (" << crossing.X() << "," << crossing.Y() << "," << crossing.Z()
               << "), wire radius " << wireRadius);
     REQUIRE(pointInsideShape(conductor, crossing, 1e-9));
+    // The emitted section is an INSCRIBED n-gon, so its flats lie at the apothem
+    // r*cos(pi/n), not at r (0.981*r at the default 16 segments). Probing at 0.99*r would
+    // land outside the copper along a face normal even for a perfectly centred wire, so the
+    // offset is measured against the apothem -- still a tight centring bound (the probe sits
+    // within ~1% of the real material boundary), just an honest one for a faceted section.
+    // ABT #860: segments <= 0 is the EXACT CIRCLE -- no flats, so the apothem IS the radius.
+    // Dividing pi by a zero segment count gave cos(inf) = NaN, and a NaN probe is inside
+    // nothing: the moment the default became analytic this helper failed four designs while
+    // the geometry was correct.
+    const double sectionApothem =
+        mvb::DEFAULT_WIRE_POLYGON_SEGMENTS > 0
+            ? wireRadius * std::cos(std::numbers::pi / mvb::DEFAULT_WIRE_POLYGON_SEGMENTS)
+            : wireRadius;
     for (const gp_Dir* d : {&perpA, &perpB}) {
         for (double sgn : {1.0, -1.0}) {
-            gp_Pnt probe(crossing.XYZ() + d->XYZ() * (sgn * 0.99 * wireRadius));
+            gp_Pnt probe(crossing.XYZ() + d->XYZ() * (sgn * 0.99 * sectionApothem));
             INFO("perpendicular probe at (" << probe.X() << "," << probe.Y() << ","
                                             << probe.Z() << ")");
             REQUIRE(pointInsideShape(conductor, probe, 1e-9));
@@ -382,25 +795,74 @@ TEST_CASE("Real winding: rectangular-column E core zigzag racetrack conductor",
     auto bobbinPd = bobbinPdOf(enriched);
     REQUIRE(bobbinPd.get_column_shape() == MAS::ColumnShape::RECTANGULAR);
     double zoff = bobbinPd.get_column_depth() - bobbinPd.get_column_width().value();
+    // Where a terminal lead leaves its wrap AT a crossing with a round corner (Alf, 2026-11-01: round lead
+    // corners are the default), the crossing is the corner's vertex: no round bend passes through its own
+    // vertex, so there the contract is that the bend's two straights -- the wrap's and the lead's -- meet
+    // exactly at the crossing (MKF's vertex, rounded). Every other crossing stays on the centreline.
+    std::vector<gp_Pnt> leadVertices;
+    {
+        const auto paths = builder.buildRealWindingPaths(enriched);
+        const mvb::ConductorBuilder::PathPolyline* path = nullptr;
+        for (const auto& pl : paths)
+            if (pl.name == "Primary parallel 0") path = &pl;
+        REQUIRE(path != nullptr);
+        auto pnt = [](const std::array<double, 3>& a) { return gp_Pnt(a[0], a[1], a[2]); };
+        auto straight = [&](size_t k) { return path->prims[k].size() == 2; };
+        for (size_t k = 0; k + 1 < path->prims.size(); ++k) {
+            if (path->primIsLead[k] == path->primIsLead[k + 1]) continue;
+            const bool leadAfter = path->primIsLead[k + 1];
+            const size_t wrap = leadAfter ? k : k + 1;
+            const size_t bend = leadAfter ? k + 1 : k;
+            if (!straight(wrap) || straight(bend)) continue;   // a sharp junction: its vertex is on the copper
+            REQUIRE((leadAfter ? bend + 1 < path->prims.size() : bend >= 1));
+            const size_t run = leadAfter ? bend + 1 : bend - 1;
+            REQUIRE(path->primIsLead[run]);
+            REQUIRE(straight(run));
+            const gp_Pnt w0 = pnt(path->prims[wrap].front()), w1 = pnt(path->prims[wrap].back());
+            const gp_Pnt r0 = pnt(path->prims[run].front()), r1 = pnt(path->prims[run].back());
+            GeomAPI_ExtremaCurveCurve meet(new Geom_Line(gp_Lin(w0, gp_Dir(gp_Vec(w0, w1)))),
+                                           new Geom_Line(gp_Lin(r0, gp_Dir(gp_Vec(r0, r1)))));
+            REQUIRE(meet.NbExtrema() > 0);
+            gp_Pnt onWrap, onRun;
+            meet.NearestPoints(onWrap, onRun);
+            INFO("the round lead corner's straights pass " << onWrap.Distance(onRun) * 1e9 << " nm apart");
+            REQUIRE(onWrap.Distance(onRun) < 1e-9);
+            leadVertices.push_back(gp_Pnt((onWrap.XYZ() + onRun.XYZ()) / 2.0));
+        }
+    }
     auto turnsOpt = enriched.get_coil().get_turns_description();
     REQUIRE(turnsOpt.has_value());
+    size_t atLeadCorners = 0;
     for (const auto& turn : *turnsOpt) {
         const auto& c = turn.get_coordinates();
         REQUIRE(c.size() >= 2);
-        requireCrossingOnCenterline(conductor->shape, gp_Pnt(0.0, c[1], -(c[0] + zoff)),
-                                    turnWireRadius(turn), gp_Dir(0, 1, 0), gp_Dir(0, 0, 1),
+        const gp_Pnt crossing(0.0, c[1], -(c[0] + zoff));
+        const double r = turnWireRadius(turn);
+        const gp_Pnt* vertex = nullptr;
+        for (const auto& v : leadVertices)
+            if (v.Distance(crossing) < r) vertex = &v;
+        if (vertex) {
+            INFO("crossing " << turn.get_name() << " is a round lead corner whose vertex stands "
+                             << vertex->Distance(crossing) * 1e9 << " nm from it");
+            CHECK(vertex->Distance(crossing) < 1e-9);
+            ++atLeadCorners;
+            continue;
+        }
+        requireCrossingOnCenterline(conductor->shape, crossing, r, gp_Dir(0, 1, 0), gp_Dir(0, 0, 1),
                                     "crossing " + turn.get_name());
     }
+    // Non-vacuous: the entrance leaves turn 0 at its crossing, round.
+    CHECK(atLeadCorners >= 1);
 
     // E-core window walls are planar (no facet sag): tangent contact only.
     requireNoPairwiseOverlap(named, 1e-10);
-    // A rectangular column's round-wire conductor is built from per-primitive cylinders + torus
-    // elbows and fused into ONE FEM-ready solid (the swept-pipe compound would sliver on the fuse).
-    int solids = 0;
-    for (TopExp_Explorer exp(conductor->shape, TopAbs_SOLID); exp.More(); exp.Next())
-        ++solids;
-    REQUIRE(solids == 1);
-    REQUIRE(!hasSelfIntersections(conductor->shape));
+    // CONFORMAL CONTRACT (femReady round wire): the conductor is a mitre-jointed compound --
+    // one CONNECTED chain of individually valid solids whose neighbours abut without volumetric
+    // overlap. (The old fused-ONE-solid contract is retired: OCC booleans on winding chains are
+    // the documented self-interference failure class -- ABT #490; conformal-by-construction is
+    // the architecture. BOPAlgo_CheckerSI is NOT run: coincident abutting faces are the intended
+    // conformal contact that gmsh's fragment+glue welds.)
+    requireConformalConductor(conductor->shape);
 }
 
 TEST_CASE("Real winding: oblong-column EP core stadium conductor", "[realwinding]") {
@@ -439,8 +901,16 @@ TEST_CASE("Real winding: oblong-column EP core stadium conductor", "[realwinding
 
 TEST_CASE("Real winding: toroidal conductor threads the exact inner and outer crossings",
           "[realwinding]") {
+    for (auto mounting : {MAS::OrientationEnum::VERTICAL, MAS::OrientationEnum::HORIZONTAL}) {
+    OpenMagnetics::SettingsGuard<MAS::OrientationEnum> mountingGuard(
+        OpenMagnetics::Settings::GetInstance(), &OpenMagnetics::Settings::get_toroid_mounting,
+        &OpenMagnetics::Settings::set_toroid_mounting, mounting);
     auto magneticJson = loadFixture("realwinding_toroid.json");
     auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+    const auto mountFrame = mvb::MagneticBuilder::toroidMountingFrameOf(enriched);
+    auto placed = [&](double cx, double cy) { return gp_Pnt(cx, 0.0, cy).Transformed(mountFrame.toExported); };
+    const gp_Dir inPlaneA = gp_Dir(1, 0, 0).Transformed(mountFrame.toExported);
+    const gp_Dir inPlaneB = gp_Dir(0, 0, 1).Transformed(mountFrame.toExported);
 
     mvb::MagneticBuilder builder;
     // Exact core (segments=0): the wall-adjacent ring's tubes touch the bore tangentially
@@ -453,10 +923,11 @@ TEST_CASE("Real winding: toroidal conductor threads the exact inner and outer cr
                                        /*useRealWindingGeometry=*/true, /*femReady=*/true);
     const auto* conductor = findConductor(named, "Primary parallel 0");
 
-    // The assembly is counter-rotated to the MAS frame (ring in XY, hole axis Z), so a
-    // hole-plane crossing (cx, cy) must lie on the copper at (cx, cy, 0) — the inner
-    // crossing of every turn, the outer (additionalCoordinates) of every wrapped turn
-    // (the last crossing entry's outer is not wrapped through).
+    // ABT #1248: the assembly is placed for its mounting. A hole-plane crossing (cx, cy) is the build
+    // point (cx, 0, cy) moved by the mounting's rigid motion (VERTICAL default: the MAS frame, ring in
+    // XY, turned about Z so the terminals sit at the bottom; before #1248 it was always the MAS frame
+    // with no turn, (cx, cy, 0)). Checked in both mountings: the inner crossing of every turn, the
+    // outer (additionalCoordinates) of every wrapped turn (the last entry's outer is not wrapped).
     auto turnsOpt = enriched.get_coil().get_turns_description();
     REQUIRE(turnsOpt.has_value());
     const auto& turns = *turnsOpt;
@@ -464,31 +935,26 @@ TEST_CASE("Real winding: toroidal conductor threads the exact inner and outer cr
         const auto& c = turns[i].get_coordinates();
         REQUIRE(c.size() >= 2);
         double wr = turnWireRadius(turns[i]);
-        requireCrossingOnCenterline(conductor->shape, gp_Pnt(c[0], c[1], 0.0), wr,
-                                    gp_Dir(1, 0, 0), gp_Dir(0, 1, 0),
+        requireCrossingOnCenterline(conductor->shape, placed(c[0], c[1]), wr,
+                                    inPlaneA, inPlaneB,
                                     "turn " + turns[i].get_name() + " inner crossing");
         if (i + 1 < turns.size()) {
             auto add = turns[i].get_additional_coordinates();
             REQUIRE(add.has_value());
             REQUIRE(!add->empty());
             requireCrossingOnCenterline(conductor->shape,
-                                        gp_Pnt((*add)[0][0], (*add)[0][1], 0.0), wr,
-                                        gp_Dir(1, 0, 0), gp_Dir(0, 1, 0),
+                                        placed((*add)[0][0], (*add)[0][1]), wr,
+                                        inPlaneA, inPlaneB,
                                         "turn " + turns[i].get_name() + " outer crossing");
         }
     }
 
     // Exact bore: wall contact is true tangency, zero interference within OCCT booleans.
     requireNoPairwiseOverlap(named, 1e-12);
-    // This 12-turn toroid sweeps to ONE FEM-ready solid via the simple MakePipe (its framing keeps
-    // the round section centred on the high-torsion hole-threading spine, where MakePipeShell's
-    // corrected Frenet drifts a crossing off-centre). Denser toroids whose spine MakePipe cannot
-    // close fall back to the exact per-run compound -- still crossing-exact, just multi-solid.
-    int solids = 0;
-    for (TopExp_Explorer exp(conductor->shape, TopAbs_SOLID); exp.More(); exp.Next())
-        ++solids;
-    REQUIRE(solids == 1);
-    REQUIRE(!hasSelfIntersections(conductor->shape));
+    // CONFORMAL CONTRACT (femReady round wire): a connected mitre compound of valid solids,
+    // no volumetric overlap between neighbours (see requireConformalConductor). The historical
+    // single-MakePipe body is retired for femReady -- conformal-by-construction, ABT #490.
+    requireConformalConductor(conductor->shape);
 
     // FEM terminal faces: the two free ends of the conductor are flat PLANAR discs (the
     // swept lead cylinder's end cap, no sphere), so downstream FEM can assign a current
@@ -501,6 +967,7 @@ TEST_CASE("Real winding: toroidal conductor threads the exact inner and outer cr
     }
     INFO("planar (terminal) faces on the conductor = " << planarFaces);
     REQUIRE(planarFaces >= 2);
+    }
 }
 
 TEST_CASE("Real winding: toroidal RECTANGULAR wire threads the crossings", "[realwinding]") {
@@ -508,8 +975,16 @@ TEST_CASE("Real winding: toroidal RECTANGULAR wire threads the crossings", "[rea
     // solids (prisms + revolved poloidal elbows) oriented on the local AZIMUTHAL axis, then fused.
     // Every MKF inner/outer crossing must still lie on the copper (the section's inscribed circle
     // is min(w,h)/2 = turnWireRadius, so the 0.99*r probes stay inside whatever the orientation).
+    for (auto mounting : {MAS::OrientationEnum::VERTICAL, MAS::OrientationEnum::HORIZONTAL}) {
+    OpenMagnetics::SettingsGuard<MAS::OrientationEnum> mountingGuard(
+        OpenMagnetics::Settings::GetInstance(), &OpenMagnetics::Settings::get_toroid_mounting,
+        &OpenMagnetics::Settings::set_toroid_mounting, mounting);
     auto magneticJson = loadFixture("realwinding_toroid_rect.json");
     auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+    const auto mountFrame = mvb::MagneticBuilder::toroidMountingFrameOf(enriched);
+    auto placed = [&](double cx, double cy) { return gp_Pnt(cx, 0.0, cy).Transformed(mountFrame.toExported); };
+    const gp_Dir inPlaneA = gp_Dir(1, 0, 0).Transformed(mountFrame.toExported);
+    const gp_Dir inPlaneB = gp_Dir(0, 0, 1).Transformed(mountFrame.toExported);
 
     mvb::MagneticBuilder builder;
     auto named = builder.buildAllNamed(enriched, true, 0,
@@ -527,16 +1002,16 @@ TEST_CASE("Real winding: toroidal RECTANGULAR wire threads the crossings", "[rea
         const auto& c = turns[i].get_coordinates();
         REQUIRE(c.size() >= 2);
         double wr = turnWireRadius(turns[i]);
-        requireCrossingOnCenterline(conductor->shape, gp_Pnt(c[0], c[1], 0.0), wr,
-                                    gp_Dir(1, 0, 0), gp_Dir(0, 1, 0),
+        requireCrossingOnCenterline(conductor->shape, placed(c[0], c[1]), wr,
+                                    inPlaneA, inPlaneB,
                                     "turn " + turns[i].get_name() + " inner crossing");
         if (i + 1 < turns.size()) {
             auto add = turns[i].get_additional_coordinates();
             REQUIRE(add.has_value());
             REQUIRE(!add->empty());
             requireCrossingOnCenterline(conductor->shape,
-                                        gp_Pnt((*add)[0][0], (*add)[0][1], 0.0), wr,
-                                        gp_Dir(1, 0, 0), gp_Dir(0, 1, 0),
+                                        placed((*add)[0][0], (*add)[0][1]), wr,
+                                        inPlaneA, inPlaneB,
                                         "turn " + turns[i].get_name() + " outer crossing");
         }
     }
@@ -546,6 +1021,7 @@ TEST_CASE("Real winding: toroidal RECTANGULAR wire threads the crossings", "[rea
     // mm^3) geometric artifact of flat wire on a curved bore, not an interference to fix, so the
     // core<->conductor tolerance here is looser than the round-wire toroid's exact-tangency 1e-12.
     requireNoPairwiseOverlap(named, 1e-9);
+    }
 }
 
 // Count the solids in a named conductor body.
@@ -565,8 +1041,76 @@ TEST_CASE("Real winding: LITZ wire builds ONE continuous body", "[realwinding]")
                                        /*useRealWindingGeometry=*/true, /*femReady=*/true);
     const auto* conductor = findConductor(named, "Primary parallel 0");
     REQUIRE(shapeVolume(conductor->shape) > 0.0);
-    REQUIRE(conductorSolidCount(conductor->shape) == 1);          // FEM-ready single body
+    REQUIRE(connectedSolidComponents(conductor->shape) == 1);    // FEM-ready CONNECTED conductor
     REQUIRE(BRepCheck_Analyzer(conductor->shape).IsValid());
+}
+
+TEST_CASE("Real winding: terminal rects are grouped by MKF's ConnectionKind, not by proximity", "[realwinding][terminal]") {
+    // ABT #1336: 14_dab_xfmr_pm8770_n97's Primary parallel 1 (round wire, 0.855 mm OD; metres).
+    // Both radial runs are ~15 mm long and centred on the window, so the EXIT's climb (at r 19.7 mm)
+    // lies nearer the ENTRANCE run's centre than its own run's. Pairing each stub with the nearest
+    // run handed it to the entrance and drew a radial jog MKF never planned.
+    auto rect = [](OpenMagnetics::ConnectionKind kind, double x, double y, double w, double h) {
+        OpenMagnetics::ConnectionReservedSpace s;
+        s.winding = "Primary";
+        s.parallel = 1;
+        s.kind = kind;
+        s.coordinates = {x, y};
+        s.dimensions = {w, h};
+        return s;
+    };
+    using K = OpenMagnetics::ConnectionKind;
+    const auto inStub = rect(K::TERMINAL_ENTRANCE, 18.8475e-3, -20.99e-3, 0.855e-3, 0.863e-3);
+    const auto inRun = rect(K::TERMINAL_ENTRANCE, 26.675e-3, -21.4223e-3, 15.655e-3, 0.855e-3);
+    const auto outStub = rect(K::TERMINAL_EXIT, 19.7025e-3, -20.10e-3, 0.855e-3, 1.361e-3);
+    const auto outRun = rect(K::TERMINAL_EXIT, 27.5e-3, -20.567e-3, 15.6e-3, 0.855e-3);
+    // The premise: the exit stub IS nearer the entrance run.
+    REQUIRE(std::hypot(outStub.coordinates[0] - inRun.coordinates[0], outStub.coordinates[1] - inRun.coordinates[1]) <
+            std::hypot(outStub.coordinates[0] - outRun.coordinates[0], outStub.coordinates[1] - outRun.coordinates[1]));
+
+    const std::vector<const OpenMagnetics::ConnectionReservedSpace*> rects{&inStub, &inRun, &outStub, &outRun};
+    const auto [entrance, exit] = mvb::splitTerminalGroups(rects, "Primary parallel 1");
+    CHECK(entrance == std::vector<const OpenMagnetics::ConnectionReservedSpace*>{&inStub, &inRun});
+    CHECK(exit == std::vector<const OpenMagnetics::ConnectionReservedSpace*>{&outStub, &outRun});
+
+    // A rect MKF did not tag as a terminal lead is refused, not guessed.
+    const auto untagged = rect(K::U_ADJACENT, 19.7025e-3, -20.10e-3, 0.855e-3, 1.361e-3);
+    CHECK_THROWS_WITH(mvb::splitTerminalGroups({&inStub, &inRun, &untagged, &outRun}, "Primary parallel 1"),
+                      Catch::Matchers::ContainsSubstring("neither TERMINAL_ENTRANCE nor TERMINAL_EXIT"));
+    // An exit lead with no entrance lead is refused.
+    CHECK_THROWS_WITH(mvb::splitTerminalGroups({&outStub, &outRun}, "Primary parallel 1"),
+                      Catch::Matchers::ContainsSubstring("exit lead but no entrance lead"));
+}
+
+TEST_CASE("Real winding: a flat strip's terminal stub shorter than the strip is wide is read as a stub", "[realwinding][terminal]") {
+    // MKF's rects for a PQ 35/40 transformer's 8-turn secondary, a 5.645 x 0.4725 mm strip between litz
+    // sections (w x h, metres): the climb from its section to the band above, and the radial
+    // runs out of the window. Read by aspect alone the 3.77 mm climb was a run, the leads split
+    // into three groups and the build was refused.
+    mvb::LeadRectReading strip;
+    strip.wireWidth = 5.645e-3;
+    strip.wireHeight = 0.4725e-3;
+    CHECK(mvb::leadRectIsAxial(5.65e-3, 3.77e-3, strip));     // short climb: a stub
+    CHECK(mvb::leadRectIsAxial(5.65e-3, 17.9e-3, strip));     // long climb: a stub
+    CHECK_FALSE(mvb::leadRectIsAxial(10.9e-3, 0.473e-3, strip));   // radial run
+    // A sleeve thickens both the same and changes nothing.
+    CHECK(mvb::leadRectIsAxial(5.65e-3 + 0.8e-3, 3.77e-3 + 0.8e-3, strip));
+    CHECK_FALSE(mvb::leadRectIsAxial(10.9e-3 + 0.8e-3, 0.473e-3 + 0.8e-3, strip));
+    // A rect no taller than the wire plus less than one wire thickness is no climb at all
+    // (realwinding_rect_wire_rect: 5.1 x 1.26 mm for a 5.1 x 1.1 mm wire; read as a climb, MKF's
+    // exit route went missing and "rectangular-column RECTANGULAR wire builds" was refused).
+    mvb::LeadRectReading onEdge;
+    onEdge.wireWidth = 5.1e-3;
+    onEdge.wireHeight = 1.1e-3;
+    CHECK_FALSE(mvb::leadRectIsAxial(5.1e-3, 1.26e-3, onEdge));
+    // A round wire keeps the aspect rule: the long side is the travel.
+    CHECK(mvb::leadRectIsAxial(0.5e-3, 3.0e-3));
+    CHECK_FALSE(mvb::leadRectIsAxial(3.0e-3, 0.5e-3));
+    // A foil: every rect is sheet-tall, the stub is the one a sheet thick (two_switch_forward).
+    mvb::LeadRectReading foil;
+    foil.foilRadial = 0.2e-3;
+    CHECK(mvb::leadRectIsAxial(0.200e-3, 39.205e-3, foil));
+    CHECK_FALSE(mvb::leadRectIsAxial(5.012e-3, 25.935e-3, foil));
 }
 
 TEST_CASE("Real winding: round-column RECTANGULAR wire is ONE body", "[realwinding]") {
@@ -579,12 +1123,17 @@ TEST_CASE("Real winding: round-column RECTANGULAR wire is ONE body", "[realwindi
                                        /*useRealWindingGeometry=*/true, /*femReady=*/true);
     const auto* conductor = findConductor(named, "Primary parallel 0");
     REQUIRE(shapeVolume(conductor->shape) > 0.0);
-    REQUIRE(conductorSolidCount(conductor->shape) == 1);
+    // ONE CONNECTED conductor: the per-run rect compound welds/touches into one component
+    // (the whole-spine single body creased at the wrap->lead fillet; see 03_buck).
+    REQUIRE(connectedSolidComponents(conductor->shape) == 1);
     REQUIRE(BRepCheck_Analyzer(conductor->shape).IsValid());
 }
 
 TEST_CASE("Real winding: rectangular-column RECTANGULAR wire builds", "[realwinding]") {
-    // 18_stacked (E70, 5x1 mm): the per-turn racetrack solids. Its copper turns TOUCH, so the fuse
+    // 18_stacked (E70, 5x1 mm), on the custom former whose column corner radius (9.9925 mm) is
+    // the minimum its on-edge wire can be wound round under IEC 60317-0-2 (ABT #1303; the design
+    // on the 0 mm 'basic' former is refused by MKF ABT #1290 before any geometry is drawn).
+    // The per-turn racetrack solids: its copper turns TOUCH, so the fuse
     // would short them into a brick -- the per-turn compound is kept (correct), so it is multi-solid
     // BY DESIGN. Assert only that it builds valid positive-volume copper for every turn.
     auto magneticJson = loadFixture("realwinding_rect_wire_rect.json");
@@ -596,6 +1145,136 @@ TEST_CASE("Real winding: rectangular-column RECTANGULAR wire builds", "[realwind
     const auto* conductor = findConductor(named, "Primary parallel 0");
     REQUIRE(shapeVolume(conductor->shape) > 0.0);
     REQUIRE(conductorSolidCount(conductor->shape) >= 1);
+}
+
+// ABT #1271. THE LEAD CORNER MUST CLOSE ONTO THE WRAP STRAIGHT IT MEETS.
+// The entrance/exit lead corner arc is built FLAT (constant axial coordinate) while the wrap
+// straight it joins carries the helical advance (dy/ds = 5.88e-3 on this design, 0.34 deg; it was
+// 6.394e-3 on the 0 mm former the defect was first measured on).
+// Each piece's cap is square to its OWN axis, so unless the coplanar-cap shear reaches this
+// junction the two cap planes cross at mid-thickness and leave a re-entrant wedge: the junction's
+// single 1.000 mm THICKNESS edge comes out as TWO 0.500 mm halves (twelve of them over the two
+// leads), the section never closes into a 4-curve W-T-W-T ring, and OMFEM's mapped-hex path
+// correctly refuses the design (8 incomplete rings, 2 blocks of 12 faces instead of 6).
+// The wedge is ~0.0043 mm^3 against a solid of tens of thousands, so a volume or
+// builds-without-throwing check CANNOT see it and passes with the shear reverted -- which is why
+// this asserts the junction CLOSES: no straight edge of the conductor measures half the wire
+// thickness. Fixture: realwinding_rect_wire_rect.json is 18_stacked itself (E 70/33/32 x2,
+// 30 turns of 5 x 1 mm rectangular wire), the design the defect was measured on, now on its
+// derived custom former (ABT #1303). Revert-checked on that former: with the shear gated back
+// to BOTH sides being leads, this test fails with 12 half-thickness (0.5 mm) edges at the two
+// lead-corner junctions (x = +-2.6005 mm), and passes with the gate as it is.
+TEST_CASE("Real winding: the lead corner closes onto the wrap straight (no half-thickness edges)",
+          "[realwinding][abt1271]") {
+    auto magneticJson = loadFixture("realwinding_rect_wire_rect.json");
+    const double wireThickness = magneticJson.at("coil")
+                                     .at("functionalDescription")[0]
+                                     .at("wire")
+                                     .at("conductingHeight")
+                                     .at("nominal")
+                                     .get<double>();
+    REQUIRE(wireThickness == Catch::Approx(0.001));   // else the 0.5 mm signature below is wrong
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+    mvb::MagneticBuilder builder;
+    // paintCoating=false: the CONDUCTING footprint, which is what the FEM product is drawn at
+    // (ABT #1261) and what the half-thickness signature below is stated in. Drawn at the coated
+    // envelope the same defect measures half of the OUTER height instead, and a 0.5 mm test would
+    // look green over it.
+    auto named = builder.buildAllNamed(enriched, true, 0, mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
+                                       mvb::DEFAULT_CORE_POLYGON_SEGMENTS, /*paintCoating=*/false,
+                                       false, false, 0.0,
+                                       /*useRealWindingGeometry=*/true, /*femReady=*/true);
+    const auto* conductor = findConductor(named, "Primary parallel 0");
+    REQUIRE(shapeVolume(conductor->shape) > 0.0);
+
+    TopTools_IndexedMapOfShape edges;
+    TopExp::MapShapes(conductor->shape, TopAbs_EDGE, edges);
+    REQUIRE(edges.Extent() > 0);
+    std::ostringstream halves;
+    int halfCount = 0, fullCount = 0;
+    for (int i = 1; i <= edges.Extent(); ++i) {
+        const TopoDS_Edge& e = TopoDS::Edge(edges(i));
+        if (BRep_Tool::Degenerated(e)) continue;
+        BRepAdaptor_Curve curve(e);
+        if (curve.GetType() != GeomAbs_Line) continue;   // only the straight section edges
+        GProp_GProps lp;
+        BRepGProp::LinearProperties(e, lp);
+        // Whole thickness edges must dominate -- if the conductor were drawn at some other
+        // thickness (the coated envelope, say) the half-thickness signature below would be
+        // measured against the wrong number and the test would pass over the defect.
+        if (std::abs(lp.Mass() - wireThickness) < 2e-6) ++fullCount;
+        // Half the THICKNESS, to 2 um -- the split-thickness edge the crossing caps produce.
+        if (std::abs(lp.Mass() - wireThickness / 2.0) > 2e-6) continue;
+        ++halfCount;
+        const gp_Pnt c = lp.CentreOfMass();
+        halves << "\n  " << lp.Mass() * 1e3 << " mm edge at (" << c.X() * 1e3 << ","
+               << c.Y() * 1e3 << "," << c.Z() * 1e3 << ") mm";
+    }
+    INFO("conductor drawn with " << fullCount << " full-thickness ("
+                                 << wireThickness * 1e3 << " mm) straight edges");
+    REQUIRE(fullCount > 100);   // 30 turns x 4 corners: the section thickness edges are there
+    INFO("half-thickness (" << wireThickness / 2.0 * 1e3 << " mm) straight edges: " << halfCount
+                            << halves.str());
+    REQUIRE(halfCount == 0);
+}
+
+// ABT #1266. A FACETED STRAIGHT MUST CARRY ONLY THE MODEL'S OWN CONFUSION.
+// Every faceted straight is a ruled prism between two cap polygons, and every side of it is an
+// exact planar trapezoid -- vertex i of the start cap joined to its own translate along the axis --
+// so the loft has nothing to approximate. Lofted in METRES it nevertheless came back with
+// 3.6-8.6 um edge and vertex tolerances (OCCT's approximation tolerances are absolute and
+// calibrated for millimetre models). On 02_flyback --segments 12 those were the seed of the four
+// ~11.85 um BOPAlgo self-intersections: grown by the booleans that met them, swallowed by the
+// one-body close's 20 um sliver repair, exposed by the STEP round trip that dropped them.
+//
+// THE FIXTURE IS THE REAL PIECE, not a stand-in. The two caps below are 'exit lead seg 0' of
+// 02_flyback_efd25_3c95's 'Primary parallel 0', read out of the one-body close's pristine operand
+// dump (MVB_ONE_BODY_DUMP) on origin/main 0a7fae1-lineage code: 12 vertices each, lateral edges
+// parallel to 1e-15 rad, start cap on the mitre plane of the wrap->lead corner, end cap flat at the
+// lead's end. That exact piece shipped at 8.302e-6 m; lofted in metres from these vertices it
+// reproduces 8.302e-6 to the last digit, lofted in millimetres it comes out at confusion.
+// A synthetic axis-aligned corner (tried first) does NOT reproduce the inflation and passes with
+// the fix reverted -- which is why the real vertices are used. Revert the millimetre-frame loft
+// in loftRuledPrism and this fails at ~8.3 um.
+TEST_CASE("Real winding: a faceted straight is lofted at the model's confusion (ABT #1266)",
+          "[realwinding][abt1266]") {
+    const std::vector<gp_Pnt> startCap{
+        {0.00019936538827139801, 0.0082500498605331506, -0.00489224680466955},
+        {0.00016469556061180299, 0.0083475996977821106, -0.0048492851906924697},
+        {8.5895690489285395e-05, 0.00841474542114495, -0.0047649829844652603},
+        {-1.59198605331505e-05, 0.0084334953882714003, -0.0046619288940666602},
+        {-0.000113469697782113, 0.0083988255606118004, -0.0045677361797957098},
+        {-0.000180615421144953, 0.0083200256904892803, -0.0045076437033741996},
+        {-0.00019936538827139801, 0.0082182101394668496, -0.0044977531953304499},
+        {-0.00016469556061180299, 0.0081206603022178896, -0.0045407148093075302},
+        {-8.5895690489283701e-05, 0.0080535145788550398, -0.0046250170155347397},
+        {1.59198605331505e-05, 0.0080347646117285999, -0.0047280711059333397},
+        {0.00011346969778211201, 0.0080694344393881998, -0.0048222638202042901},
+        {0.000180615421144953, 0.0081482343095107095, -0.0048823562966258003}};
+    std::vector<gp_Pnt> endCap;
+    for (const auto& p : startCap) endCap.emplace_back(p.X(), p.Y(), -0.0072019999999997503);
+
+    std::string why;
+    const TopoDS_Shape prism = mvb::loftRuledPrism(startCap, endCap, &why);
+    INFO("loftRuledPrism: " << (prism.IsNull() ? why : std::string("built")));
+    REQUIRE_FALSE(prism.IsNull());
+    REQUIRE(BRepCheck_Analyzer(prism).IsValid());
+    // It IS that piece: 12 sides + 2 caps, one solid.
+    int faces = 0, solids = 0;
+    for (TopExp_Explorer e(prism, TopAbs_FACE); e.More(); e.Next()) ++faces;
+    for (TopExp_Explorer e(prism, TopAbs_SOLID); e.More(); e.Next()) ++solids;
+    REQUIRE(faces == 14);
+    REQUIRE(solids == 1);
+
+    double worst = 0.0;
+    for (TopExp_Explorer e(prism, TopAbs_VERTEX); e.More(); e.Next())
+        worst = std::max(worst, BRep_Tool::Tolerance(TopoDS::Vertex(e.Current())));
+    for (TopExp_Explorer e(prism, TopAbs_EDGE); e.More(); e.Next())
+        worst = std::max(worst, BRep_Tool::Tolerance(TopoDS::Edge(e.Current())));
+    INFO("loosest sub-shape tolerance " << worst << " m; Precision::Confusion() = "
+                                        << Precision::Confusion() << " m (shipped: 8.302e-6 m)");
+    // Confusion is the model's own resolution; the factor only absorbs its last-bit rounding.
+    CHECK(worst <= Precision::Confusion() * (1.0 + 1e-9));
 }
 
 TEST_CASE("Real winding: MULTI-LAYER spread 3-winding toroidal CMC builds clean",
@@ -610,8 +1289,9 @@ TEST_CASE("Real winding: MULTI-LAYER spread 3-winding toroidal CMC builds clean"
     // through). Ring returns are depth-staggered under the core. The three windings must
     // be fully independent bodies with two layers each.
     auto magneticJson = loadFixture("realwinding_cmc_3w_2layer.json");
-    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, true);
-    // Confirm the fixture really is 2 rings per section (else the test is vacuous).
+    // Fixture sanity via the CLASSIC path (the real-winding enrichment refuses this layout,
+    // asserted below): 2 rings per section, else the test is vacuous.
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, false);
     {
         auto layers = enriched.get_coil().get_layers_description();
         REQUIRE(layers.has_value());
@@ -623,6 +1303,23 @@ TEST_CASE("Real winding: MULTI-LAYER spread 3-winding toroidal CMC builds clean"
                 ++primaryConductionLayers;
         REQUIRE(primaryConductionLayers == 2);
     }
+
+    // TWO-LAYER sections bury the inner layer's entrance: ring 2 nests one wire OD inside
+    // ring 1 (crossings 1.47 mm apart at a 1.4 mm envelope -- the TURNS are legal), but every
+    // straight-dressed lead path from ring 1's start crossing is then blocked by ring 2's
+    // returns. A real winder lays the lead FIRST and winds layer 2 around it -- rigid MAS turn
+    // geometry cannot express that (lead-space reservation is the layout's job, MKF ABT #187),
+    // so the routed-lead builder must REFUSE loudly rather than emit overlapping copper.
+    // FULL 2-layer build, end-to-end validated. The chain that makes it possible (all in MKF's
+    // layout, per Alf's ruling that the final 3D must come out non-crossing from the winder):
+    // (1) the INPUT-CONNECTION ANGULAR CORRIDOR -- rings after the first surrender the
+    // connection parallels' angular slots at the section-start edge (span shrunk + shifted),
+    // so no later ring places a station behind the connection; (2) per-ring capacity measured
+    // at the ring's own radius (kills the ABT #563 overhang); (3) the outer-crossing sweep
+    // discards candidates whose implied 3D runs would cross a connection vertical. Measured
+    // layout here: ring 0 holds 10 stations from the entrance, ring 1 starts one corridor
+    // later -- and the leads route with the classic 90-degree drop.
+    enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
 
     mvb::MagneticBuilder builder;
     // CMC spread windings stay on the fast drawing compound (femReady=false): the test only asserts
@@ -692,6 +1389,98 @@ TEST_CASE("Real winding: pre-enriched input with the flag on throws", "[realwind
         Catch::Matchers::ContainsSubstring("geometricalDescription"));
 }
 
+// ABT #646 — a design that could not be routed until the layout was re-wound.
+//
+// A real user design: E 16/8/8, N87-class 95, one winding, 12 turns of Synthesized Litz
+// 31x0.100mm, 2 conduction layers. Real winding used to refuse it, because the Primary
+// entrance lead and an inter-layer dragback were COINCIDENT — centreline distance 8.3e-19 m,
+// i.e. exactly zero, against 0.000802 m required.
+//
+// The cause was upstream and not in the router: MKF's magnetic_autocomplete only wound a coil
+// that had no turnsDescription, so a design arriving already wound kept a layout laid out
+// WITHOUT the connection corridors. Layer 1 spanned the full 10.2 mm window with a turn sitting
+// exactly on the input connection's reserved rectangle, and the router was handed turn positions
+// that had never reserved a slot for the lead it then had to route. MKF 90594876 re-winds when
+// real winding is asked for; layer 1 comes back one wire slot shorter at the bottom and the
+// conductor routes.
+//
+// This asserts the ROUTE, not the refusal: a design that regresses to a collision here is a
+// layout regression, and the exception text will say exactly which two runs met.
+TEST_CASE("Real winding: the ABT #646 litz design routes once the layout is re-wound",
+          "[realwinding][abt646]") {
+    auto magneticJson = loadFixture("realwinding_e16_litz_2layer_leadcollision.json");
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+    mvb::MagneticBuilder builder;
+
+    // Idealised loops were never affected: the defect was in the routed conductor.
+    REQUIRE_NOTHROW(builder.buildAllNamed(enriched, true, 0, mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
+                                          mvb::DEFAULT_CORE_POLYGON_SEGMENTS, true));
+
+    std::vector<mvb::NamedShape> named;
+    REQUIRE_NOTHROW(named = builder.buildAllNamed(enriched, true, 0, /*wireSeg=*/0,
+                                                  mvb::DEFAULT_CORE_POLYGON_SEGMENTS, true, false,
+                                                  false, 0.0, /*useRealWindingGeometry=*/true));
+    REQUIRE_FALSE(named.empty());
+
+    // The re-wound layer must actually be shorter than the window — that is the fix, and a
+    // full-height layer would mean the corridors were not reserved even if nothing collided.
+    auto enrichedCoil = enriched.get_coil();
+    auto layers = enrichedCoil.get_layers_description().value();
+    double windowHeight = enrichedCoil.resolve_bobbin()
+                              .get_processed_description().value()
+                              .get_winding_windows()[0].get_height().value();
+    bool anyShortened = false;
+    for (const auto& layer : layers) {
+        if (layer.get_type() != MAS::ElectricalType::CONDUCTION) continue;
+        if (layer.get_dimensions()[1] < windowHeight - 1e-9) anyShortened = true;
+    }
+    INFO("window height " << windowHeight);
+    CHECK(anyShortened);
+}
+
+// The routed conductors, exported so the winding can be inspected in CAD. No collision gate is
+// skipped here any more: this design routes, so the file is real geometry.
+TEST_CASE("Real winding: export the ABT #646 design",
+          "[realwinding][abt646][diagnostic]") {
+    auto magneticJson = loadFixture("realwinding_e16_litz_2layer_leadcollision.json");
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+
+    mvb::MagneticBuilder builder;
+    auto all = builder.buildAllNamed(enriched, /*includeBobbin=*/true, 0, /*wireSeg=*/0,
+                                     mvb::DEFAULT_CORE_POLYGON_SEGMENTS, /*paintCoating=*/true,
+                                     false, false, 0.0, /*useRealWindingGeometry=*/true);
+    REQUIRE_FALSE(all.empty());
+    const std::string path = outputPath("abt646_e16_litz_realwinding.step");
+    REQUIRE(mvb::exportSTEP(all, path));
+    WARN("ABT #646 real-winding geometry written to " << path);
+}
+
+TEST_CASE("Real winding: a DRAWN toroid (no femReady) is the conformal mitre compound, no copper in copper",
+          "[realwinding][toroid][drawn]") {
+    // The corpus design 05_pfc_inductor_t4020_hf60 exactly as the gate takes it: the MAS example,
+    // MKF autocomplete, `mvbpp_step_generator --real` (drawing, femReady=false). A drawn toroid used
+    // to be routed around the conformal assembler to the legacy per-run compound: per-turn pipes
+    // and per-primitive cylinders joined by wire-radius spheres, each sphere half inside both of
+    // its neighbours (0.134 of its 0.268 mm^3), so `mvbpp_stepcheck --audit` found 257 copper
+    // self-overlaps and 48 overlaps in this one conductor. Drawn, it must be what FEM gets: abutting
+    // pieces, no point strictly inside two of them.
+    std::ifstream f(std::string(MAS_EXAMPLES_DIR) + "/05_pfc_inductor_t4020_hf60.json");
+    REQUIRE(f.good());
+    json j = json::parse(f);
+    auto enriched = mvb::magnetic_autocomplete_safe(j.contains("magnetic") ? j.at("magnetic") : j,
+                                                    /*useRealWindingGeometry=*/true);
+    mvb::MagneticBuilder builder;
+    auto named = builder.buildAllNamed(enriched, /*includeBobbin=*/true, /*symmetryPlanes=*/0,
+                                       mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
+                                       mvb::DEFAULT_CORE_POLYGON_SEGMENTS, /*paintCoating=*/false,
+                                       /*emitCoatingShells=*/false, /*includeInsulation=*/false,
+                                       /*coreCoatingThickness=*/0.0,
+                                       /*useRealWindingGeometry=*/true, /*femReady=*/false);
+    const auto* conductor = findConductor(named, "Primary parallel 0");
+    REQUIRE(conductor != nullptr);
+    requireConformalConductor(conductor->shape);
+}
+
 TEST_CASE("Real winding: FEM dense toroid is a conformal (non-overlapping) mitre compound",
           "[realwinding]") {
     // A 60-turn toroid is too dense for the single-solid MakePipe sweep to close on its packed hole
@@ -700,6 +1489,25 @@ TEST_CASE("Real winding: FEM dense toroid is a conformal (non-overlapping) mitre
     // ABUT on a coincident elliptical face rather than interpenetrating. This is the FEM-meshable
     // (no double material) form of a winding that cannot be a single solid.
     auto magneticJson = loadFixture("realwinding_toroid_3in.json");
+    // At the fixture's full 60 turns the hole packs TWO layers. Historically this was a hard
+    // refusal (no lead corridor anywhere); with MKF's input-connection angular corridor the
+    // second ring now starts one corridor past the entrance, the layout re-flows, and the FULL
+    // 60-turn build goes through validated -- assert exactly that.
+    {
+        auto denseEnriched =
+            mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+        mvb::MagneticBuilder denseBuilder;
+        auto denseNamed =
+            denseBuilder.buildAllNamed(denseEnriched, true, 0, mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
+                                       0, true, false, false, 0.0,
+                                       /*useRealWindingGeometry=*/true, /*femReady=*/true);
+        const auto* denseConductor = findConductor(denseNamed, "Primary parallel 0");
+        REQUIRE(denseConductor != nullptr);
+        requireConformalConductor(denseConductor->shape);
+    }
+    // The conformal mitre-compound structure is exercised at the densest ROUTABLE packing of
+    // the same core/wire: 30 turns = a full single layer (rim gap 0.3 mm).
+    magneticJson["coil"]["functionalDescription"][0]["numberTurns"] = 30;
     auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
 
     mvb::MagneticBuilder builder;
@@ -709,25 +1517,1118 @@ TEST_CASE("Real winding: FEM dense toroid is a conformal (non-overlapping) mitre
     const auto* conductor = findConductor(named, "Primary parallel 0");
     REQUIRE(conductor != nullptr);
 
-    std::vector<TopoDS_Solid> solids;
-    for (TopExp_Explorer e(conductor->shape, TopAbs_SOLID); e.More(); e.Next())
-        solids.push_back(TopoDS::Solid(e.Current()));
-    // MakePipe can't close one body here, so the conductor is a multi-solid conformal compound.
-    REQUIRE(solids.size() > 1);
-    // Every mitred solid is watertight/valid -- the per-solid ShapeFix makes the torus cut-curves
-    // survive a STEP round-trip (they were valid in memory but degraded on reload without it).
-    for (const auto& s : solids) REQUIRE(BRepCheck_Analyzer(s).IsValid());
+    int nSolids = solidCount(conductor->shape);
+    // WAS `nSolids > 1`: MakePipe cannot close this dense toroid, so the assembler left it a
+    // multi-solid conformal compound and the test pinned that. ABT #1265 then closed the
+    // assembly with a glued fuse ("an object per wire to simulate in FEM"), and this conductor
+    // now comes out as ONE body -- 132 pieces into 1 on the CMC, 69 on the buck. The old
+    // assertion was pinning the emission strategy; what the test is FOR is that the conductor is
+    // not a heap of disconnected per-turn loops (see solidCount's comment above), and one body
+    // satisfies that completely. So: one body when the close succeeds, and when it does not, the
+    // compound must still be conformal -- which is what the next line checks either way.
+    REQUIRE(nSolids >= 1);
+    // Connected + per-solid valid + neighbours abut WITHOUT interpenetration. The overlap probe
+    // is the junction-grid classifier, NOT BRepAlgoAPI_Common: Common on abutting BSpline pipe
+    // pairs of this toroid ground >10 min/pair in 2d-extrema root-finding or returned !IsDone
+    // (both measured here) -- the exact OCC-boolean pathology the conformal build avoids.
+    if (nSolids > 1) requireConformalConductor(conductor->shape);
+}
 
-    // Conformal: neighbouring (consecutive-primitive) solids share a mitre face and do NOT overlap.
-    // Sample consecutive pairs across the whole winding and require ~zero common volume; a plain
-    // overlapping per-run compound would carry ~0.5-1 mm^3 (5e-10 m^3) at each joint here.
-    int checked = 0;
-    int stride = std::max<int>(1, static_cast<int>(solids.size()) / 15);
-    for (size_t i = 0; i + 1 < solids.size(); i += static_cast<size_t>(stride)) {
-        double v = commonVolume(solids[i], solids[i + 1]);
-        INFO("mitre neighbour overlap [" << i << "," << (i + 1) << "] = " << v);
-        REQUIRE(v <= 1e-12);
-        ++checked;
+TEST_CASE("Real winding: export the 8t x 2p multi-parallel design",
+          "[realwinding][abt685][diagnostic]") {
+    // ABT #685 before/after comparison (Alf: "can you show me one STEP from before and one from
+    // after"). MVB_STEP_OUT names the file so the same binary can write both sides of a
+    // rebuild; MVB_LEAD_NO_VALIDATE skips the collision gate when the point IS to look at a
+    // collision.
+    auto magneticJson = loadFixture("realwinding_round_2p.json");
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+
+    mvb::MagneticBuilder builder;
+    auto all = builder.buildAllNamed(enriched, /*includeBobbin=*/true, 0, /*wireSeg=*/0,
+                                     mvb::DEFAULT_CORE_POLYGON_SEGMENTS, /*paintCoating=*/true,
+                                     false, false, 0.0, /*useRealWindingGeometry=*/true);
+    REQUIRE_FALSE(all.empty());
+    const char* out = std::getenv("MVB_STEP_OUT");
+    const std::string path = out ? out : outputPath("abt685_multiparallel.step");
+    REQUIRE(mvb::exportSTEP(all, path));
+    WARN("8t x 2p real-winding geometry written to " << path);
+}
+
+TEST_CASE("TMP failing-case export and overlap location", "[tmpfail]") {
+    auto magneticJson = loadFixture("realwinding_round_2p.json");
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, true);
+    mvb::MagneticBuilder builder;
+    auto named = builder.buildAllNamed(enriched, true, 0, mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
+                                       mvb::DEFAULT_CORE_POLYGON_SEGMENTS, true, false, false, 0.0,
+                                       true);
+    const mvb::NamedShape* p0 = nullptr;
+    const mvb::NamedShape* p1 = nullptr;
+    for (const auto& ns : named) {
+        if (ns.name == "Primary parallel 0") p0 = &ns;
+        if (ns.name == "Primary parallel 1") p1 = &ns;
     }
-    REQUIRE(checked >= 10);
+    REQUIRE(p0);
+    REQUIRE(p1);
+    // Solids in EXPORT ORDER — the order a STEP viewer numbers them ("Primary parallel 0",
+    // then 001, 002, ...). Prim indices are not it: degenerate slivers are pruned first.
+    auto solidsOf = [](const TopoDS_Shape& sh) {
+        std::vector<TopoDS_Shape> out;
+        for (TopExp_Explorer e(sh, TopAbs_SOLID); e.More(); e.Next()) out.push_back(e.Current());
+        return out;
+    };
+    const auto s0 = solidsOf(p0->shape);
+    const auto s1 = solidsOf(p1->shape);
+    auto nameOf = [](const char* base, size_t k) {
+        char buf[64];
+        if (k == 0) std::snprintf(buf, sizeof buf, "%s", base);
+        else std::snprintf(buf, sizeof buf, "%s%02zu", base, k);
+        return std::string(buf);
+    };
+    std::fprintf(stderr, "[solids] Primary parallel 0: %zu solids, Primary parallel 1: %zu\n",
+                 s0.size(), s1.size());
+    for (size_t a = 0; a < s0.size(); ++a) {
+        for (size_t b = 0; b < s1.size(); ++b) {
+            Bnd_Box ba, bb;
+            BRepBndLib::Add(s0[a], ba);
+            BRepBndLib::Add(s1[b], bb);
+            if (ba.IsOut(bb)) continue;
+            BRepAlgoAPI_Common common(s0[a], s1[b]);
+            if (!common.IsDone()) continue;
+            const double v = shapeVolume(common.Shape());
+            if (v <= 1e-15) continue;
+            std::fprintf(stderr, "[hit] %-24s  vs  %-24s   common = %.4e mm3\n",
+                         nameOf("Primary parallel 0", a).c_str(),
+                         nameOf("Primary parallel 1", b).c_str(), v * 1e9);
+        }
+    }
+}
+
+TEST_CASE("TMP fixture probe", "[tmpfix]") {
+    const char* name = std::getenv("MVB_FIXTURE");
+    REQUIRE(name != nullptr);
+    std::ifstream f(std::string(MAS_EXAMPLES_DIR) + "/" + name);
+    REQUIRE(f.good());
+    json j = json::parse(f);
+    auto magneticJson = j.contains("magnetic") ? j.at("magnetic") : j;
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, true);
+    mvb::MagneticBuilder builder;
+    try {
+        auto named = builder.buildAllNamed(enriched, true, 0, mvb::DEFAULT_WIRE_POLYGON_SEGMENTS,
+                                           mvb::DEFAULT_CORE_POLYGON_SEGMENTS, true, false, false,
+                                           0.0, true);
+        std::fprintf(stderr, "[fix] %s BUILT ok\n", name);
+        const char* out = std::getenv("MVB_STEP_OUT");
+        if (out) REQUIRE(mvb::exportSTEP(named, out));
+    } catch (const std::exception& e) {
+        std::fprintf(stderr, "[fix] %s THROW: %s\n", name, e.what());
+    }
+}
+
+// ABT #353 -- NO ROUTED COPPER IN THE FLANGE. The WE-TI 7447720470 drum is the design the ticket
+// was filed on: its winding groove runs y = [-3.2488, +3.2488] mm and its flanges fill the bands
+// beyond that (the bottom one out to r = 3.898 mm, the top one to r = 2.498 mm), so anything a
+// router places "just below the winding" is inside ferrite. The Z end-run planner did exactly
+// that -- its duck plane came from the copper ring inventory alone and sat 0.23 mm below the
+// groove floor, with the wire 0.44 mm into the flange -- and it now classifies every candidate
+// lane against the core solids instead (planZEndRuns). This is the design-level pin: what MVB++
+// routes on this drum stays in the groove.
+//
+// SCOPE (Alf, 2026-08-23): copper touching the core is a filling-factor consequence of what the
+// user asked for, not something the builder vetoes -- there is deliberately no general
+// copper-vs-core refusal in the build. What is pinned here is MVB++'s own PLACEMENT on a design
+// whose turns fit their window with room to spare; a failure means a router put copper in the
+// ferrite, and is not to be relaxed away.
+//
+// Deliberately on the PATH (centreline) API: it exercises the same routing as the solid build
+// without depending on wire assembly, so a defect in the assembler cannot mask -- or fake -- a
+// routing regression.
+TEST_CASE("Real winding: the drum's connections stay out of the core flange (ABT #353)",
+          "[realwinding]") {
+    auto magneticJson = loadFixture("realwinding_drum_we_ti.json");
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+
+    mvb::MagneticBuilder builder;
+    // Hands the core solids down to ConductorBuilder as routing obstacles.
+    auto paths = builder.buildRealWindingPaths(enriched);
+    REQUIRE(!paths.empty());
+    auto coreShapes = builder.buildCoreNamed(enriched.get_core());
+    REQUIRE(!coreShapes.empty());
+
+    // The obstacle, measured from the CORE SOLID itself rather than from any dimension in the
+    // fixture: the flange radius is the core's own bounding radius, and the groove floor/ceiling
+    // are found by walking the axis of the winding band until the classifier reports material.
+    // Nothing here can be defused by editing a number in the JSON.
+    double flangeR = 0.0;
+    for (const auto& ns : coreShapes) {
+        Bnd_Box bx;
+        BRepBndLib::Add(ns.shape, bx);
+        double x0, y0, z0, x1, y1, z1;
+        bx.Get(x0, y0, z0, x1, y1, z1);
+        flangeR = std::max({flangeR, std::abs(x0), std::abs(x1), std::abs(z0), std::abs(z1)});
+    }
+    REQUIRE(flangeR > 0.0);
+
+    std::vector<std::unique_ptr<BRepClass3d_SolidClassifier>> cls;
+    for (const auto& ns : coreShapes)
+        for (TopExp_Explorer se(ns.shape, TopAbs_SOLID); se.More(); se.Next())
+            cls.push_back(std::make_unique<BRepClass3d_SolidClassifier>(se.Current()));
+    REQUIRE(!cls.empty());
+    auto material = [&](double x, double y, double z) {
+        for (auto& c : cls) {
+            c->Perform(gp_Pnt(x, y, z), 1e-9);
+            if (c->State() == TopAbs_IN) return true;
+        }
+        return false;
+    };
+
+    // The groove and the two flanges, MEASURED from the solid (this drum's flanges differ:
+    // the bottom one is the full 7.8 mm OD, the top one only 5.0 mm). Walk the post's own
+    // radius up and down until material starts -- that is the groove face -- then walk radially
+    // inside each flange band to find how far that flange reaches.
+    const double step = flangeR / 2000.0;
+    double postR = 0.0;
+    for (double r = step; r < flangeR; r += step)
+        if (material(r, 0.0, 0.0)) postR = r;
+    REQUIRE(postR > 0.0);
+    const double rGroove = postR + 4.0 * step;
+    REQUIRE(!material(rGroove, 0.0, 0.0));
+    double yFloor = 0.0, yCeil = 0.0;
+    for (double y = 0.0; y > -flangeR * 4.0; y -= step)
+        if (material(rGroove, y, 0.0)) { yFloor = y + step; break; }
+    for (double y = 0.0; y < flangeR * 4.0; y += step)
+        if (material(rGroove, y, 0.0)) { yCeil = y - step; break; }
+    REQUIRE(yFloor < 0.0);
+    REQUIRE(yCeil > 0.0);
+    double rBottomFlange = 0.0, rTopFlange = 0.0;
+    for (double r = rGroove; r < flangeR + step; r += step) {
+        if (material(r, yFloor - 4.0 * step, 0.0)) rBottomFlange = r;
+        if (material(r, yCeil + 4.0 * step, 0.0)) rTopFlange = r;
+    }
+    REQUIRE(rBottomFlange > postR);
+    REQUIRE(rTopFlange > postR);
+    std::fprintf(stderr,
+                 "[ABT353] drum measured from the solid: post r=%.4f mm, groove y=[%.4f, %.4f] "
+                 "mm, bottom flange to r=%.4f mm, top flange to r=%.4f mm\n",
+                 postR * 1e3, yFloor * 1e3, yCeil * 1e3, rBottomFlange * 1e3, rTopFlange * 1e3);
+
+    int inFlange = 0, inCore = 0;
+    double deepest = 0.0;   // worst excursion past a groove face, over the flange (metres)
+    for (const auto& p : paths) {
+        for (const auto& prim : p.prims) {
+            for (const auto& q : prim) {
+                const double r = std::hypot(q[0], q[2]);
+                const double ux = r > 1e-12 ? q[0] / r : 1.0;
+                const double uz = r > 1e-12 ? q[2] / r : 0.0;
+                // (a) the ticket's own measurement: the wire TUBE reaching past the groove floor
+                //     or ceiling while still under that side's flange is copper inside ferrite.
+                {
+                    const double over =
+                        std::max(r <= rBottomFlange ? yFloor - (q[1] - p.wireRadius) : -1.0,
+                                 r <= rTopFlange ? (q[1] + p.wireRadius) - yCeil : -1.0);
+                    if (over > 1e-9) {
+                        INFO("copper at r=" << r * 1e3 << " mm y=" << q[1] * 1e3
+                                            << " mm reaches " << over * 1e3
+                                            << " mm past the groove face (floor " << yFloor * 1e3
+                                            << ", ceiling " << yCeil * 1e3 << " mm, flanges r="
+                                            << rBottomFlange * 1e3 << "/" << rTopFlange * 1e3
+                                            << " mm) in '" << p.name << "'");
+                        ++inFlange;
+                        deepest = std::max(deepest, over);
+                    }
+                }
+                // (b) the general statement: no part of the wire tube is inside a core solid.
+                const std::array<std::array<double, 3>, 5> probes{{
+                    {q[0], q[1], q[2]},
+                    {q[0], q[1] - p.wireRadius, q[2]},
+                    {q[0], q[1] + p.wireRadius, q[2]},
+                    {q[0] - ux * p.wireRadius, q[1], q[2] - uz * p.wireRadius},
+                    {q[0] + ux * p.wireRadius, q[1], q[2] + uz * p.wireRadius}}};
+                for (const auto& pr : probes) {
+                    if (!material(pr[0], pr[1], pr[2])) continue;
+                    INFO("copper at (" << q[0] * 1e3 << "," << q[1] * 1e3 << "," << q[2] * 1e3
+                                       << ") mm has tube material inside the core, in '" << p.name
+                                       << "'");
+                    ++inCore;
+                    break;
+                }
+            }
+        }
+    }
+    std::fprintf(stderr, "[ABT353] deepest excursion into a flange band: %.4f mm\n",
+                 deepest * 1e3);
+    CHECK(inFlange == 0);
+    CHECK(inCore == 0);
+}
+
+// A FOIL TERMINAL IS MKF'S AXIAL LEAD, WELDED TO ITS SHEET (ABT #1907, Alf 2026-10-18/19).
+//
+// The example states each foil end's lead: connections[].exit "axial" with the round
+// connections[].leadConductor "Round 0.5 - Grade 1". MKF plans it (ConnectionRoute::axialLead):
+// tangent to the sheet's outer face along the sheet's height, then straight along the column axis
+// through the end face to one lead diameter past the flange's outer face -- and the WELD STRIP that
+// joins it to the sheet (AxialLead::weld), because tangent copper touches along a line only and
+// carries no current. MVB++ draws exactly that and fuses sheet, strips and leads into the
+// parallel's ONE body, whose only port caps are the lead tips. This holds every parallel to it:
+// one valid solid, no lead body of its own and no solder anywhere; the lead drawn on the stated
+// conductor's copper from MKF's attach to MKF's end, past the flange; a cap at each tip and none
+// on the sheet's edges; and the strip at MKF's numbers, measured as the copper in the slab around
+// the lead: the sheet's, the lead's and the wedge the strip fills between them, which is set by
+// MKF's width (a strip of another width, or none, changes it).
+TEST_CASE("Real winding: a foil terminal is MKF's axial lead, welded to its sheet into one body and "
+          "leaving through the end face",
+          "[realwinding][foil]") {
+    auto magneticJson = loadFixture("two_switch_forward_transformer_complete.json");
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+    const auto routes = enriched.get_mutable_coil().get_connection_layout().routes;
+    const double wall = enriched.get_mutable_coil().resolve_bobbin().get_processed_description().value().get_wall_thickness();
+    auto sheetWire = enriched.get_mutable_coil().resolve_wire(1);
+    REQUIRE(sheetWire.get_type() == MAS::WireType::FOIL);
+    const double sheetThickness = sheetWire.get_maximum_conducting_width();
+    const double sheetHeight = sheetWire.get_maximum_conducting_height();
+
+    mvb::MagneticBuilder builder;
+    auto named = builder.buildAllNamed(enriched, /*includeBobbin=*/false, /*symmetryPlanes=*/0,
+                                       /*wirePolygonSegments=*/0,
+                                       mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
+                                       /*paintCoating=*/false, /*emitCoatingShells=*/false,
+                                       /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
+                                       /*useRealWindingGeometry=*/true, /*femReady=*/true);
+    for (const auto& ns : named) {
+        INFO("solid '" << ns.name << "'");
+        CHECK(ns.role != mvb::Role::Solder);
+        CHECK(ns.name.find("solder") == std::string::npos);
+        CHECK(ns.name.find(" entrance lead") == std::string::npos);
+        CHECK(ns.name.find(" exit lead") == std::string::npos);
+    }
+    auto find = [&](const std::string& n) {
+        for (const auto& ns : named)
+            if (ns.name == n) return ns.shape;
+        FAIL("no shape named '" << n << "' in the build");
+        return TopoDS_Shape{};
+    };
+
+    int leads = 0;
+    for (const auto& route : routes) {
+        if (route.winding != "Secondary") continue;
+        const bool entrance = route.kind == OpenMagnetics::ConnectionKind::TERMINAL_ENTRANCE;
+        if (!entrance && route.kind != OpenMagnetics::ConnectionKind::TERMINAL_EXIT) continue;
+        const std::string sheetName = "Secondary parallel " + std::to_string(route.parallel);
+        INFO(sheetName << (entrance ? " entrance" : " exit"));
+        REQUIRE(route.axialLead);
+        const auto& axial = route.axialLead.value();
+        const auto& weld = axial.weld;
+        // MKF's plan is the stated conductor, through the flange, with its weld strip.
+        CHECK(axial.outerDiameter > axial.conductingDiameter);
+        CHECK(std::abs(axial.flangeOuterFace - axial.windowEdge) == Catch::Approx(wall).margin(1e-12));
+        CHECK(std::abs(axial.end - axial.flangeOuterFace) == Catch::Approx(axial.outerDiameter).margin(1e-12));
+        REQUIRE(wall > 0.0);
+        REQUIRE(weld.width > 0.0);
+        REQUIRE(weld.layerTo > weld.layerFrom);
+
+        // ONE body: sheet, both leads and both strips.
+        const TopoDS_Shape body = find(sheetName);
+        int solids = 0;
+        for (TopExp_Explorer e(body, TopAbs_SOLID); e.More(); e.Next()) ++solids;
+        REQUIRE(solids == 1);
+        CHECK(BRepCheck_Analyzer(body).IsValid());
+        // The lead is in it, out to MKF's end past the flange.
+        Bnd_Box bb;
+        BRepBndLib::AddOptimal(body, bb, /*useTriangulation=*/false, /*useShapeTolerance=*/false);
+        double bx0, by0, bz0, bx1, by1, bz1;
+        bb.Get(bx0, by0, bz0, bx1, by1, bz1);
+        CHECK((axial.end > 0 ? by1 : -by0) == Catch::Approx(std::abs(axial.end)).margin(1e-9));
+
+        // Its port cap at this end: the lead's copper disc at MKF's end, at the lead's slot.
+        const TopoDS_Shape cap = find(sheetName + " terminal " + std::to_string(entrance ? 0 : 1));
+        GProp_GProps cp;
+        BRepGProp::SurfaceProperties(cap, cp);
+        const double r = 0.5 * axial.conductingDiameter;
+        CHECK(cp.Mass() == Catch::Approx(std::numbers::pi * r * r).epsilon(1e-6));
+        CHECK(cp.CentreOfMass().Y() == Catch::Approx(axial.end).margin(1e-9));
+        CHECK(std::abs(cp.CentreOfMass().X()) == Catch::Approx(axial.alongFace).margin(1e-9));
+        const double zLead = cp.CentreOfMass().Z();
+
+        // The copper in the slab around the lead -- one lead outer diameter along the face, the
+        // attach along the turn axis, from the sheet's inner face to the lead's top on the layer
+        // axis: the sheet's, the lead's, and the strip's wedge at MKF's width, nothing else.
+        const double zs = zLead > 0 ? 1.0 : -1.0;
+        const double zSheetMid = zLead - zs * (axial.layerAxis - weld.layerFrom);
+        const double zA = zSheetMid - zs * 0.5 * sheetThickness, zB = zLead + zs * r;
+        const double xC = cp.CentreOfMass().X();
+        const gp_Pnt lo(xC - 0.5 * axial.outerDiameter, std::min(weld.from, weld.to), std::min(zA, zB));
+        const gp_Pnt hi(xC + 0.5 * axial.outerDiameter, std::max(weld.from, weld.to), std::max(zA, zB));
+        BRepAlgoAPI_Common inSlab(body, BRepPrimAPI_MakeBox(lo, hi).Shape());
+        REQUIRE(inSlab.IsDone());
+        GProp_GProps sp;
+        BRepGProp::VolumeProperties(inSlab.Shape(), sp);
+        const double a = 0.5 * weld.width;
+        const double wedge = weld.width * r - (a * std::sqrt(r * r - a * a) + r * r * std::asin(a / r));
+        const double attach = std::abs(weld.to - weld.from);
+        CHECK(attach == Catch::Approx(sheetHeight).margin(1e-9));
+        const double expected = attach * (axial.outerDiameter * sheetThickness + std::numbers::pi * r * r + wedge);
+        INFO("slab copper " << sp.Mass() * 1e9 << " mm^3, expected " << expected * 1e9 << " mm^3 (wedge "
+                            << wedge * attach * 1e9 << " mm^3, weld width " << weld.width * 1e3 << " mm)");
+        CHECK(sp.Mass() == Catch::Approx(expected).epsilon(1e-6));
+        ++leads;
+    }
+    REQUIRE(leads == 16);   // 8 parallels, two ends each
+    // No cap on a sheet's edge: two per parallel, the lead tips.
+    size_t caps = 0;
+    for (const auto& ns : named)
+        if (ns.name.rfind("Secondary parallel ", 0) == 0 && ns.name.find(" terminal ") != std::string::npos) ++caps;
+    CHECK(caps == 16);
+}
+
+// ABT #1111 (2026-09-06). The FEM product's periodic-face -> B-spline pass used to run in
+// buildAllNamed, in METRES; exportSTEP then scaled the poles x1000 and left the knots alone, so
+// every length-parametrised B-spline direction (a facet strip's generatrix, a planar cap) spanned
+// 1000 mm of geometry per parameter unit. BOPAlgo converts 3D tolerances to parameter space
+// through exactly that ratio and reported sporadic self-intersections on faceted revolves: 11 of
+// 38 corpus designs at --segments 12, each one clean again once rescaled to metres. The pass now
+// runs inside the exporter on the millimetre shape. This reads the written file back and checks
+// the invariant directly: no B-spline face may span more than a few millimetres of geometry per
+// parameter unit (a well-parametrised conversion spans ~1 mm/unit along a length, ~r mm/rad
+// along an angle), and every solid must pass BOPAlgo's self-intersection analysis.
+TEST_CASE("Real winding: the FEM STEP's B-splines are parametrised in the millimetres they are "
+          "written in",
+          "[realwinding][step][nurbs]") {
+    auto magneticJson = loadFixture("realwinding_e138_rectcolumn.json");  // E 13/7/4, 6 turns, 0.4 mm round
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+
+    mvb::MagneticBuilder builder;
+    auto named = builder.buildAllNamed(enriched, /*includeBobbin=*/false, /*symmetryPlanes=*/0,
+                                       /*wirePolygonSegments=*/12,
+                                       mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
+                                       /*paintCoating=*/false, /*emitCoatingShells=*/false,
+                                       /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
+                                       /*useRealWindingGeometry=*/true, /*femReady=*/true);
+    REQUIRE_FALSE(named.empty());
+
+    const std::string path = outputPath("abt1111_e138_seg12_fem.step");
+    mvb::StepExportOptions opts;
+    opts.nurbsPeriodicSolids = true;
+    REQUIRE(mvb::exportSTEP(named, path, opts));
+
+    const auto back = mvb::importSTEP(path);
+    REQUIRE_FALSE(back.empty());
+    int bsplineFaces = 0, periodicFaces = 0, solids = 0, faulty = 0;
+    double worstMmPerUnit = 0.0;
+    std::string worstFace;
+    for (const auto& ns : back) {
+        for (TopExp_Explorer se(ns.shape, TopAbs_SOLID); se.More(); se.Next(), ++solids) {
+            int fidx = 0;
+            for (TopExp_Explorer fe(se.Current(), TopAbs_FACE); fe.More(); fe.Next(), ++fidx) {
+                const TopoDS_Face f = TopoDS::Face(fe.Current());
+                Handle(Geom_Surface) srf = BRep_Tool::Surface(f);
+                if (!srf.IsNull() && (srf->IsUPeriodic() || srf->IsVPeriodic())) ++periodicFaces;
+                BRepAdaptor_Surface ad(f, false);
+                if (ad.GetType() != GeomAbs_BSplineSurface) continue;
+                ++bsplineFaces;
+                // Resolution(1 mm) is the parameter step that moves the surface by 1 mm, i.e.
+                // 1 / (mm per parameter unit). Metre-scale knots under mm poles give 1e-3.
+                for (double res : {ad.UResolution(1.0), ad.VResolution(1.0)}) {
+                    if (!(res > 0.0)) continue;
+                    const double mmPerUnit = 1.0 / res;
+                    if (mmPerUnit > worstMmPerUnit) {
+                        worstMmPerUnit = mmPerUnit;
+                        worstFace = ns.name + " solid " + std::to_string(solids) + " face " +
+                                    std::to_string(fidx);
+                    }
+                }
+            }
+            BOPAlgo_ArgumentAnalyzer an;
+            an.SetShape1(se.Current());
+            an.SelfInterMode() = Standard_True;
+            an.ArgumentTypeMode() = Standard_False;
+            an.Perform();
+            if (an.HasFaulty()) ++faulty;
+        }
+    }
+    INFO("solids " << solids << ", B-spline faces " << bsplineFaces << ", periodic faces left "
+                   << periodicFaces << ", worst parametrisation " << worstMmPerUnit
+                   << " mm per parameter unit at " << worstFace);
+    // The design carries faceted revolves at 12 segments, so the pass had something to convert.
+    REQUIRE(bsplineFaces > 0);
+    CHECK(periodicFaces == 0);
+    // Length-parametrised directions span ~1 mm/unit, angles ~r mm/rad (r < 1 mm here). The
+    // metre-frame conversion this guards against sits at 1000.
+    CHECK(worstMmPerUnit < 20.0);
+    CHECK(faulty == 0);
+    std::filesystem::remove(path);
+}
+
+// ABT #1111 (2026-09-06): in faceted mode an arc bent tighter than kFacetTightArcExactRatio wire
+// radii is revolved on the exact round profile (a torus), because the 12-gon's innermost facet
+// strip on such a piece is micrometres long and BOPAlgo rejects it. The in-memory FEM product
+// keeps its analytic surfaces (the B-spline re-expression happens in the exporter), so the rule
+// is visible directly: the winding must contain tori, every one of them tighter than the ratio,
+// and each with the wire's own minor radius.
+TEST_CASE("Real winding: faceted mode revolves tight arcs exactly, and only tight arcs",
+          "[realwinding][tightarc]") {
+    // A toroid: its window corners are ARC3 pieces bent at kRoundCornerBendFactor (1.05 r), the
+    // tightest arcs the assembler emits. (A rect-column design's corners are pitched SPIRALs and
+    // would exercise nothing here.)
+    auto magneticJson = loadFixture("realwinding_toroid.json");
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+
+    mvb::MagneticBuilder builder;
+    auto named = builder.buildAllNamed(enriched, /*includeBobbin=*/false, /*symmetryPlanes=*/0,
+                                       /*wirePolygonSegments=*/12,
+                                       mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
+                                       /*paintCoating=*/false, /*emitCoatingShells=*/false,
+                                       /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
+                                       /*useRealWindingGeometry=*/true, /*femReady=*/true);
+    REQUIRE_FALSE(named.empty());
+
+    int tori = 0, loose = 0;
+    double minorMin = 1e300, minorMax = 0.0, ratioMax = 0.0;
+    for (const auto& ns : named) {
+        if (ns.name.find(" parallel ") == std::string::npos || ns.name.find(" terminal ") != std::string::npos)
+            continue;
+        for (TopExp_Explorer fe(ns.shape, TopAbs_FACE); fe.More(); fe.Next()) {
+            BRepAdaptor_Surface ad(TopoDS::Face(fe.Current()), false);
+            if (ad.GetType() != GeomAbs_Torus) continue;
+            ++tori;
+            const gp_Torus t = ad.Torus();
+            const double ratio = t.MajorRadius() / t.MinorRadius();
+            ratioMax = std::max(ratioMax, ratio);
+            minorMin = std::min(minorMin, t.MinorRadius());
+            minorMax = std::max(minorMax, t.MinorRadius());
+            if (ratio >= mvb::kFacetTightArcExactRatio) ++loose;
+        }
+    }
+    INFO("torus faces " << tori << ", tightest-to-loosest bend ratio max " << ratioMax
+                        << ", minor radius " << minorMin * 1e6 << ".." << minorMax * 1e6 << " um");
+    // The terminal-corner fillets sit at 1.05 r, so the rule must have fired somewhere...
+    CHECK(tori > 0);
+    // ...and nowhere else: a faceted design has no other reason to carry a torus.
+    CHECK(loose == 0);
+    // The revolve is of the wire itself: one radius for every torus, and a wire-sized one.
+    CHECK(minorMax - minorMin < 1e-9);
+    CHECK(minorMin > 0.05e-3);
+    CHECK(minorMax < 1.0e-3);
+}
+
+TEST_CASE("Real winding: the weld mode decides whether a conductor ships as one body or as its pieces",
+          "[realwinding][weld]") {
+    CHECK(mvb::parseWeldMode("off") == mvb::WeldMode::Off);
+    CHECK(mvb::parseWeldMode("auto") == mvb::WeldMode::Auto);
+    CHECK(mvb::parseWeldMode("all") == mvb::WeldMode::All);
+    CHECK_THROWS_AS(mvb::parseWeldMode("On"), std::invalid_argument);
+    CHECK(std::string(mvb::weldModeName(mvb::WeldMode::All)) == "all");
+
+    auto magneticJson = loadFixture("realwinding_toroid.json");
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+    auto conductorSolids = [&](std::optional<mvb::WeldMode> mode) {
+        mvb::MagneticBuilder builder;
+        if (mode) builder.setWeldMode(*mode);
+        auto named = builder.buildAllNamed(enriched, /*includeBobbin=*/false, /*symmetryPlanes=*/0,
+                                           /*wirePolygonSegments=*/12,
+                                           mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
+                                           /*paintCoating=*/false, /*emitCoatingShells=*/false,
+                                           /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
+                                           /*useRealWindingGeometry=*/true, /*femReady=*/true);
+        int solids = 0, conductors = 0;
+        for (const auto& ns : named) {
+            if (ns.name.find(" parallel ") == std::string::npos ||
+                ns.name.find(" terminal ") != std::string::npos)
+                continue;
+            ++conductors;
+            for (TopExp_Explorer e(ns.shape, TopAbs_SOLID); e.More(); e.Next()) ++solids;
+        }
+        REQUIRE(conductors > 0);
+        return std::pair<int, int>(conductors, solids);
+    };
+    const auto off = conductorSolids(mvb::WeldMode::Off);
+    const auto autoMode = conductorSolids(mvb::WeldMode::Auto);
+    const auto all = conductorSolids(mvb::WeldMode::All);
+    INFO("conductors " << autoMode.first << ": solids off " << off.second << ", auto "
+                       << autoMode.second << ", all " << all.second);
+    // Auto and All close every conductor into one body; Off ships the abutting pieces.
+    CHECK(autoMode.second == autoMode.first);
+    CHECK(all.second == all.first);
+    CHECK(off.first == autoMode.first);
+    CHECK(off.second > 10 * off.first);
+}
+
+TEST_CASE("Real winding: a toroid's face chords turn round into their exactly round corners",
+          "[realwinding][tightarc]") {
+    // ABT #1853. A toroid's window corners are revolved exactly round, and the face chord between
+    // them is a radius-varying spiral. Without a round transition the chord's 12-gon met the
+    // corner's circle on one plane and left 12 circular-segment faces per joint, each
+    // r^2 (pi/6 - sin(pi/6)) / 2 = 0.0118 r^2 in area and r (1 - cos(pi/12)) = 3.4% r deep -- the
+    // micron lunes OMFEM's surface mesher fails on (current_transformer: 7,152 of them).
+    auto magneticJson = loadFixture("realwinding_toroid.json");
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+    mvb::MagneticBuilder builder;
+    auto named = builder.buildAllNamed(enriched, /*includeBobbin=*/false, /*symmetryPlanes=*/0,
+                                       /*wirePolygonSegments=*/12,
+                                       mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
+                                       /*paintCoating=*/false, /*emitCoatingShells=*/false,
+                                       /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
+                                       /*useRealWindingGeometry=*/true, /*femReady=*/true);
+    REQUIRE_FALSE(named.empty());
+    // The wire radius is the round corners' own: their torus minor radius.
+    double r = 0.0;
+    int planar = 0, lunes = 0, tori = 0;
+    for (const auto& ns : named) {
+        if (ns.name.find(" parallel ") == std::string::npos) continue;
+        for (TopExp_Explorer fe(ns.shape, TopAbs_FACE); fe.More(); fe.Next()) {
+            BRepAdaptor_Surface ad(TopoDS::Face(fe.Current()), false);
+            if (ad.GetType() != GeomAbs_Torus) continue;
+            ++tori;
+            r = std::max(r, ad.Torus().MinorRadius());
+        }
+    }
+    REQUIRE(tori > 0);   // the round corners exist, so there are joints to test
+    for (const auto& ns : named) {
+        if (ns.name.find(" parallel ") == std::string::npos) continue;
+        for (TopExp_Explorer fe(ns.shape, TopAbs_FACE); fe.More(); fe.Next()) {
+            BRepAdaptor_Surface ad(TopoDS::Face(fe.Current()), false);
+            if (ad.GetType() != GeomAbs_Plane) continue;
+            ++planar;
+            GProp_GProps g;
+            BRepGProp::SurfaceProperties(fe.Current(), g);
+            if (g.Mass() >= 0.05 * r * r) continue;
+            // A lune is bounded by an arc of the circle. The staggered continuation's flat rim
+            // wedges between two collinear prisms (straight-edged triangles, by design -- see
+            // mitredFacetPrism) are not lunes.
+            bool arc = false;
+            for (TopExp_Explorer ee(fe.Current(), TopAbs_EDGE); ee.More() && !arc; ee.Next())
+                arc = BRepAdaptor_Curve(TopoDS::Edge(ee.Current())).GetType() != GeomAbs_Line;
+            if (arc) ++lunes;
+        }
+    }
+    INFO("wire radius " << r * 1e6 << " um: " << tori << " torus faces, " << planar
+                        << " planar faces, " << lunes << " arc-bounded under 0.05 r^2");
+    CHECK(lunes == 0);
+}
+
+// ---------------------------------------------------------------------------------------
+// TOROID TERMINALS DROP TO ONE PLANE (Alf, 2026-09-12; ABT #1159, superseding the #1155 x/z tip
+// pinning). ABT #1248 moved these checks to the EXPORTED frame (buildRealWindingPaths now returns
+// it, the frame of the STEP) and runs them in BOTH mountings: before #1248 the paths came back in
+// the build frame, where the drops ran -Y while the STEP showed them along +Z. The -Y direction
+// and the one-plane assertions are unchanged; the "not gratuitously lower" bound now also accepts
+// a plane set by the CORE (a standing ring's bare rim can reach below the copper). Every toroidal terminal lead ends with a -Y drop past the rim, and every tip of the
+// component lies on ONE XZ plane below the lowest copper surface by max(2 OD of the thinnest
+// wire, 1 OD of the thickest) -- like a real toroid dressed for the board. Under the old rule the tips pointed
+// radially from their own crossing azimuths, sat on a circle, and common_mode_choke_complete was
+// refused outright ("runs nearly parallel to the common terminal plane").
+namespace {
+struct ToroidPlaneReport { size_t tips; double planeY; double lowestCopperY; double clearance; };
+
+ToroidPlaneReport requireToroidTerminalsOnOnePlane(const std::string& fixture,
+                                                   MAS::OrientationEnum mounting) {
+    OpenMagnetics::SettingsGuard<MAS::OrientationEnum> mountingGuard(
+        OpenMagnetics::Settings::GetInstance(), &OpenMagnetics::Settings::get_toroid_mounting,
+        &OpenMagnetics::Settings::set_toroid_mounting, mounting);
+    auto magneticJson = loadFixture(fixture);
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+    mvb::MagneticBuilder builder;
+    std::vector<mvb::ConductorBuilder::PathPolyline> paths;
+    // Includes the collision gate: the now-parallel drops are checked against each other.
+    REQUIRE_NOTHROW(paths = builder.buildRealWindingPaths(enriched));
+    REQUIRE(!paths.empty());
+
+    struct Tip { std::string owner; std::array<double, 3> p, u; };
+    std::vector<Tip> tips;
+    double odMax = 0.0, odMin = std::numeric_limits<double>::max();
+    for (const auto& path : paths) {
+        tips.push_back({path.name + " end0", path.end0, path.dir0});
+        tips.push_back({path.name + " end1", path.end1, path.dir1});
+        odMax = std::max(odMax, 2.0 * path.wireRadius);
+        odMin = std::min(odMin, 2.0 * path.wireRadius);
+    }
+    const double clearance = std::max(2.0 * odMin, odMax);
+    double planeLo = std::numeric_limits<double>::max(), planeHi = std::numeric_limits<double>::lowest();
+    for (const auto& t : tips) {
+        INFO(fixture << ": " << t.owner << " at (" << t.p[0] * 1e3 << ", " << t.p[1] * 1e3 << ", "
+                     << t.p[2] * 1e3 << ") mm dir (" << t.u[0] << ", " << t.u[1] << ", " << t.u[2] << ")");
+        // Every terminal points straight down: the port normal is -Y for all of them.
+        CHECK(std::fabs(t.u[0]) < 1e-9);
+        CHECK(std::fabs(t.u[2]) < 1e-9);
+        CHECK(t.u[1] < -(1.0 - 1e-9));
+        planeLo = std::min(planeLo, t.p[1]);
+        planeHi = std::max(planeHi, t.p[1]);
+    }
+    INFO(fixture << ": tip plane y spans [" << planeLo * 1e3 << ", " << planeHi * 1e3 << "] mm");
+    CHECK(planeHi - planeLo < 1e-9);
+
+    // The plane sits `clearance` below the lowest copper that is NOT a drop. A sampled point
+    // whose envelope reaches below (plane + clearance) must belong to a drop: same (x, z) as a tip.
+    double lowest = std::numeric_limits<double>::max();
+    for (const auto& path : paths) {
+        for (const auto& prim : path.prims) {
+            for (const auto& q : prim) {
+                bool onDrop = false;
+                for (const auto& t : tips)
+                    if (std::hypot(q[0] - t.p[0], q[2] - t.p[2]) < 1e-6) { onDrop = true; break; }
+                if (onDrop) continue;
+                lowest = std::min(lowest, q[1] - path.wireRadius);
+            }
+        }
+    }
+    // The core in the exported frame: the plane clears it too (ABT #1248).
+    Bnd_Box coreBox;
+    const auto frame = mvb::MagneticBuilder::toroidMountingFrameOf(enriched);
+    for (const auto& ns : builder.buildCoreNamed(enriched.get_core()))
+        BRepBndLib::AddOptimal(BRepBuilderAPI_Transform(ns.shape, frame.toExported, true).Shape(),
+                               coreBox, false, false);
+    REQUIRE_FALSE(coreBox.IsVoid());
+    const double coreBottom = coreBox.CornerMin().Y();
+    INFO(fixture << (mounting == MAS::OrientationEnum::VERTICAL ? " VERTICAL" : " HORIZONTAL")
+                 << ": lowest non-drop copper surface " << lowest * 1e3 << " mm, core bottom "
+                 << coreBottom * 1e3 << " mm, plane "
+                 << planeLo * 1e3 << " mm, clearance max(2 OD_thin, 1 OD_thick) = "
+                 << clearance * 1e3 << " mm");
+    CHECK(planeLo <= lowest - clearance + 1e-9);
+    CHECK(planeLo <= coreBottom - clearance + 1e-9);
+    lowest = std::min(lowest, coreBottom);
+    // ... and not gratuitously lower. The lowest non-drop copper is the rim fillet's underside,
+    // and the consumer polyline samples that arc coarsely enough to miss its extremum by ~10 % of
+    // an OD (measured 0.12 / 0.06 / 0.40 mm on CMC / buck / CT), so the bound carries a
+    // quarter-OD (of the thickest wire) of slack; the builder measures the same arcs finer.
+    CHECK(planeLo >= lowest - clearance - 0.25 * odMax);
+    return {tips.size(), planeLo, lowest, clearance};
+}
+} // namespace
+
+TEST_CASE("Real winding: CMC toroid terminals all drop to one plane below the part (ABT #1159)",
+          "[realwinding][toroidtips]") {
+    // Two windings on opposite sides of the ring: under the radial-tip rule no common plane
+    // could hold their four tips. Now all four drop in -Y onto one plane.
+    for (auto m : {MAS::OrientationEnum::VERTICAL, MAS::OrientationEnum::HORIZONTAL}) {
+        const auto r = requireToroidTerminalsOnOnePlane("common_mode_choke_complete.json", m);
+        CHECK(r.tips == 4);
+    }
+}
+
+TEST_CASE("Real winding: the 3-parallel buck toroid's six terminals share one plane (ABT #1155)",
+          "[realwinding][toroidtips]") {
+    // Six leads at six azimuths, six drops, one plane, and the gate proves the parallel drops
+    // clear each other.
+    for (auto m : {MAS::OrientationEnum::VERTICAL, MAS::OrientationEnum::HORIZONTAL}) {
+        const auto r = requireToroidTerminalsOnOnePlane("buck_inductor_complete.json", m);
+        CHECK(r.tips == 6);
+    }
+}
+
+TEST_CASE("Real winding: single-turn toroid primary drops both terminals without collision",
+          "[realwinding][toroidtips]") {
+    // A one-turn bore-through conductor: entrance and exit share the crossing azimuth, so the
+    // exit's drop from the top face would run straight through the entrance lead below unless
+    // the router moves it -- and the gate must SEE that pair (same turn ordinal, different
+    // terminals).
+    for (auto m : {MAS::OrientationEnum::VERTICAL, MAS::OrientationEnum::HORIZONTAL}) {
+        const auto r = requireToroidTerminalsOnOnePlane("current_transformer_complete.json", m);
+        CHECK(r.tips >= 4);
+    }
+}
+
+// =====================================================================================
+// PSPS E16 flyback, 2p / 4p (Alf's web export custom_magnetic (56), 2026-09-23).
+//
+// E16/8/5, P-S-S-P interleaved, Primary 10t x 2p, Secondary 4t x 4p, 0.5 mm round, U
+// sections. Every parallel crosses from its section 0 to its section 1 exactly once, on the
+// -Z face, through a radial step at its lane slot. The design MKF accepts is refused by the
+// gate (Primary p0's step and p1's band run 1.5 um apart) and, with the gate skipped, shows
+// three more defects Alf read off the STEP. The tests below pin each contract; they were
+// written FAILING ([!shouldfail]) on 2026-09-23 and flipped the same day, the cm37 way, when
+// MKF gave each side-by-side sibling its own band row (#1361), a level inter-section return
+// became one step at the crossing with no lane (#1360), and lanes went per face in parallel
+// order (#1359) -- the design then built CERTIFIED CLEAR (0 nm, every pair proven). Any
+// regression in that chain shows here as the gate's own refusal.
+//
+//   ABT #1359  lane order  -- the lanes must respect the parallel order along the travel
+//              direction, per winding. Today they are allocated over ALL conductors,
+//              centre-out alternating, which puts the Secondary's steps at 3, 1, 0, 2 along
+//              the face and the Primary's inverted in X.
+//   ABT #1360  pitch-true  -- the incoming face reaches the row AT the slot, the radial step
+//              is the return's only primitive, and the next turn slopes away FROM the slot.
+//              Today: wrap cut at the slot, stub up (0.121 mm), stub down, flat run to x = 0.
+//   ABT #1361  (MKF) both Primary parallels share ONE band row; side by side on a rect
+//              former that is unroutable in-plane. Only the certified build pins it.
+namespace {
+
+constexpr const char* kPspsFixture = "realwinding_psps_e16_flyback_2p4p.json";
+
+OpenMagnetics::Magnetic enrichPsps() {
+    auto magneticJson = loadFixture(kPspsFixture);
+    mvb::patch_dimension_nominals(magneticJson);   // the CLI's own preprocessing
+    return mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+}
+
+// The two lane probes need the centrelines of a design the gate refuses. The documented
+// diagnostic gate (ConductorBuilder::Options::diagnosticSkipCollisionCheck, reached from the
+// outside as MVB_SKIP_COLLISION_CHECK) exists for exactly this: "Tools and tests investigating
+// a specific refusal only". Scoped, so no other test inherits it.
+struct ScopedSkipCollisionCheck {
+    ScopedSkipCollisionCheck() { setenv("MVB_SKIP_COLLISION_CHECK", "1", 1); }
+    ~ScopedSkipCollisionCheck() { unsetenv("MVB_SKIP_COLLISION_CHECK"); }
+};
+
+using Poly = std::vector<std::array<double, 3>>;
+double dxOf(const Poly& p) { return p.back()[0] - p.front()[0]; }
+double dyOf(const Poly& p) { return p.back()[1] - p.front()[1]; }
+double dzOf(const Poly& p) { return p.back()[2] - p.front()[2]; }
+
+struct SectionCrossing {
+    size_t step;         // prims index of the radial step (dx = 0, |dz| >= a layer)
+    double slotX;        // the lane the step sits on
+    double travelSign;   // +1 / -1: sign of dx of the last face run before the step
+};
+
+// The inter-section returns of one conductor: a radial step is a non-lead primitive that
+// crosses one layer's depth in z (the layer direction on the -Z face) without moving along
+// the face, carrying at most the entry turn's residual (half a wire) in y. Nothing else on
+// this design does that -- the -X / +X faces move 6.35 mm in z, the corners are arcs, the
+// stubs (seg 0 / seg 2) move only in y.
+std::vector<SectionCrossing> sectionCrossings(const mvb::ConductorBuilder::PathPolyline& path) {
+    std::vector<SectionCrossing> out;
+    for (size_t i = 0; i < path.prims.size(); ++i) {
+        if (path.primIsLead[i]) continue;
+        const auto& p = path.prims[i];
+        if (std::abs(dxOf(p)) > 1e-6 || std::abs(dyOf(p)) > 3e-4 ||
+            std::abs(dzOf(p)) < 3e-4 || std::abs(dzOf(p)) > 2e-3)
+            continue;
+        SectionCrossing c{i, p.front()[0], 0.0};
+        for (size_t k = i; k-- > 0;) {
+            if (std::abs(dxOf(path.prims[k])) > 1e-3) {
+                c.travelSign = dxOf(path.prims[k]) > 0 ? 1.0 : -1.0;
+                break;
+            }
+        }
+        REQUIRE(c.travelSign != 0.0);
+        out.push_back(c);
+    }
+    return out;
+}
+
+int parallelOf(const std::string& pathName) {
+    const auto at = pathName.rfind("parallel ");
+    REQUIRE(at != std::string::npos);
+    return std::stoi(pathName.substr(at + 9));
+}
+std::string windingOf(const std::string& pathName) {
+    return pathName.substr(0, pathName.rfind(" parallel "));
+}
+
+}  // namespace
+
+TEST_CASE("Real winding: the PSPS E16 flyback (2p / 4p) builds CERTIFIED CLEAR (ABT #1359/#1360/#1361)",
+          "[realwinding][psps]") {
+    auto enriched = enrichPsps();
+    mvb::MagneticBuilder builder;
+    // EXACTLY the CLI's path and config (mvbpp_step_generator --real): that is where Alf saw
+    // the refusal. The gate is the assertion.
+    mvb::DrawConfig cfg{"step", /*includeBobbin=*/true, /*scale=*/1.0, /*symmetryPlanes=*/0};
+    cfg.useRealWindingGeometry = true;
+    REQUIRE_NOTHROW(builder.drawMagnetic(enriched, outputPath(""), cfg));
+}
+
+TEST_CASE("Real winding: inter-section lanes follow the parallel order along the travel direction (ABT #1359)",
+          "[realwinding][psps]") {
+    ScopedSkipCollisionCheck diagnostic;
+    auto enriched = enrichPsps();
+    mvb::MagneticBuilder builder;
+    // The probe reads MKF's routing, so it draws sharp corners: a round dragback end puts a 1.05r arc between the
+    // radial step and the face it is probed against (Alf, 2026-11-01).
+    builder.setRoundedLeadCorners(false);
+    const auto paths = builder.buildRealWindingPaths(enriched);
+    REQUIRE(paths.size() == 6);   // Primary x 2, Secondary x 4
+
+    // winding -> (parallel, slot measured along the travel direction)
+    std::map<std::string, std::vector<std::pair<int, double>>> lanes;
+    for (const auto& path : paths) {
+        const auto crossings = sectionCrossings(path);
+        INFO(path.name);
+        REQUIRE(crossings.size() == 1);   // one section 0 -> section 1 return per conductor
+        lanes[windingOf(path.name)].push_back(
+            {parallelOf(path.name), crossings[0].slotX * crossings[0].travelSign});
+    }
+    REQUIRE(lanes.size() == 2);
+    for (auto& [winding, byParallel] : lanes) {
+        std::sort(byParallel.begin(), byParallel.end());
+        for (size_t i = 1; i < byParallel.size(); ++i) {
+            INFO(winding << ": parallel " << byParallel[i - 1].first << " at "
+                         << byParallel[i - 1].second * 1e3 << " mm, parallel "
+                         << byParallel[i].first << " at " << byParallel[i].second * 1e3
+                         << " mm along the travel direction");
+            // Alf: p0 steps first, the last parallel last -- never 3, 1, 0, 2. Equal when the
+            // returns need no lane at all (a level return steps at the crossing itself).
+            CHECK(byParallel[i].second >= byParallel[i - 1].second);
+        }
+    }
+}
+
+TEST_CASE("Real winding: an inter-section return is pitch-true at both ends -- the radial step alone (ABT #1360)",
+          "[realwinding][psps]") {
+    ScopedSkipCollisionCheck diagnostic;
+    auto enriched = enrichPsps();
+    mvb::MagneticBuilder builder;
+    // The probe reads MKF's routing, so it draws sharp corners: a round dragback end puts a 1.05r arc between the
+    // radial step and the face it is probed against (Alf, 2026-11-01).
+    builder.setRoundedLeadCorners(false);
+    const auto paths = builder.buildRealWindingPaths(enriched);
+    REQUIRE(paths.size() == 6);
+
+    for (const auto& path : paths) {
+        const auto crossings = sectionCrossings(path);
+        INFO(path.name);
+        REQUIRE(crossings.size() == 1);
+        const size_t s = crossings[0].step;
+        REQUIRE(s > 0);
+        REQUIRE(s + 1 < path.prims.size());
+        const auto& before = path.prims[s - 1];
+        const auto& after = path.prims[s + 1];
+        // The primitive feeding the step is the incoming FACE, climbing its pitch to the row --
+        // not a stub standing at the slot (dx = 0). Today Secondary p3 arrives 0.121 mm low
+        // and seg 0 stands the difference.
+        INFO("before the step: dx = " << dxOf(before) * 1e3 << " mm, dy = " << dyOf(before) * 1e3 << " mm");
+        CHECK(std::abs(dxOf(before)) > 1e-3);
+        CHECK(std::abs(dyOf(before)) > 1e-5);
+        // The primitive leaving the step is the next turn's FACE, sloping away from the slot --
+        // not a stub (seg 2, dx = 0) and not the flat walk back to the plane (seg 3, dy = 0).
+        INFO("after the step: dx = " << dxOf(after) * 1e3 << " mm, dy = " << dyOf(after) * 1e3 << " mm");
+        CHECK(std::abs(dxOf(after)) > 1e-3);
+        CHECK(std::abs(dyOf(after)) > 1e-5);
+    }
+}
+
+// ---- ABT #1403: no kinked bridge, and nothing unsound leaves the assembler ------------------
+namespace {
+struct ScopedEnv1403 {
+    std::string name;
+    ScopedEnv1403(const char* n, const char* v) : name(n) { setenv(n, v, 1); }
+    ~ScopedEnv1403() { unsetenv(name.c_str()); }
+};
+}   // namespace
+
+// The isolated buck-boost's Primary top wraps ended their climb at a 2.23 deg C0 kink (a helix
+// meeting the level run past its station). The assembler judged it "bridged" -- its wedge under
+// the sampling sag -- grew the helix into the level run and welded two caps crossing at 2.2 deg
+// into a non-manifold sliver. Read straight off the centreline, as the assembler will judge it:
+// no junction may be BRIDGED at a nonzero angle. (A bridged junction is only sound when it is
+// tangent; a kink under the sag is still a kink.)
+TEST_CASE("Real winding: no junction is bridged at a nonzero angle -- isolated buck-boost (ABT #1403)",
+          "[realwinding][abt1403]") {
+    ScopedEnv1403 plane("MVB_FAN_TERMINALS_ON_PLANE", "1");
+    auto magneticJson = loadFixture("realwinding_isolated_buckboost_litz_2p.json");
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+    mvb::MagneticBuilder builder;
+    const auto paths = builder.buildRealWindingPaths(enriched);
+    REQUIRE_FALSE(paths.empty());
+    size_t junctions = 0, spiralArc = 0, kinkedBridges = 0;
+    for (const auto& path : paths) {
+        for (const auto& j : path.junctions) {
+            ++junctions;
+            const bool sa = (j.fromKind == mvb::Primitive::SPIRAL && j.toKind == mvb::Primitive::ARC3) ||
+                            (j.fromKind == mvb::Primitive::ARC3 && j.toKind == mvb::Primitive::SPIRAL);
+            if (sa) ++spiralArc;
+            if (j.verdict == mvb::JunctionVerdict::Bridge && j.angle > mvb::kTangentJunctionAngle) {
+                ++kinkedBridges;
+                UNSCOPED_INFO(path.name << ": '" << j.fromLabel << "' -> '" << j.toLabel << "' bridged at "
+                                        << j.angle * 180.0 / std::numbers::pi << " deg");
+            }
+        }
+    }
+    // The filter matched: the paths carry junctions, and SPIRAL<->ARC3 ones among them (the
+    // level runs past the stations are arcs).
+    REQUIRE(junctions > 0);
+    REQUIRE(spiralArc > 0);
+    CHECK(kinkedBridges == 0);
+}
+
+// The refusal itself, on the minimal chain that produced the defect: a helix at the measured
+// slope (dy/ds 0.038858) running into a LEVEL arc at the same radius -- a 2.23 deg SPIRAL->ARC3
+// kink whose wedge (8.85 um) sits under the sag (9.11 um) of the 0.455 mm Litz. assembleWire must
+// throw naming the pieces, not bridge and weld it.
+TEST_CASE("Assembler: a kinked SPIRAL->ARC3 bridge is refused, not welded (ABT #1403)",
+          "[realwinding][abt1403]") {
+    ScopedEnv1403 weld("MVB_WELD_ALL", "1");
+    const double rw = 0.455368e-3, r = 8.3866e-3, slope = 0.038858;
+    const double azSpan = std::numbers::pi / 2.0;
+    mvb::Primitive helix;
+    helix.kind = mvb::Primitive::SPIRAL;
+    helix.spiral = {0.0, 0.0, r, 0.0, 0.0, r, slope * r * azSpan, azSpan};
+    helix.label = "test helix";
+    mvb::Primitive level;
+    level.kind = mvb::Primitive::ARC3;
+    const double y1 = helix.spiral.y1;
+    level.arc.c = gp_Pnt(0.0, y1, 0.0);
+    level.arc.axis = gp_XYZ(0.0, 1.0, 0.0);
+    level.arc.v0 = mvb::azPointC(0.0, 0.0, r, y1, azSpan).XYZ() - level.arc.c.XYZ();
+    level.arc.sweep = 0.3;
+    level.label = "test level run";
+    const double ang = mvb::junctionAngle(helix, level, rw);
+    INFO("junction angle " << ang * 180.0 / std::numbers::pi << " deg");
+    REQUIRE(ang > mvb::kTangentJunctionAngle);
+    REQUIRE(mvb::junctionVerdict(ang, helix.kind, level.kind, rw) == mvb::JunctionVerdict::Bridge);
+    const std::vector<const mvb::Primitive*> chain{&helix, &level};
+    REQUIRE_THROWS_WITH(mvb::assembleWire(chain, rw, 12, mvb::CornerStyle::BisectionMitre, nullptr,
+                                          false, "test conductor"),
+                        Catch::Matchers::ContainsSubstring("refusing to bridge and weld"));
+}
+
+// The manifold gate, on shapes whose defect is certain by construction: a solid holding the same
+// closed shell twice uses every edge four times (non-manifold). A single box passes.
+// (Self-intersection is not a draw-time check any more -- see the [stepvalidity] tests.)
+TEST_CASE("Assembler: the manifold gate throws on a non-manifold solid (ABT #1403)",
+          "[realwinding][abt1403]") {
+    auto shellOf = [](const TopoDS_Shape& s) {
+        TopExp_Explorer x(s, TopAbs_SHELL);
+        REQUIRE(x.More());
+        return TopoDS::Shell(x.Current());
+    };
+    const TopoDS_Shape box = BRepPrimAPI_MakeBox(gp_Pnt(0, 0, 0), 1.0, 1.0, 1.0).Shape();
+    CHECK(mvb::requireManifoldCopper(box, "clean box") == 1);
+
+    BRep_Builder bb;
+    TopoDS_Solid doubled;
+    bb.MakeSolid(doubled);
+    bb.Add(doubled, shellOf(box));
+    bb.Add(doubled, shellOf(box));
+    CHECK_THROWS_WITH(mvb::requireManifoldCopper(doubled, "doubled shell"),
+                      Catch::Matchers::ContainsSubstring("NON-MANIFOLD"));
+}
+
+// ---- ABT #1400: every port clears the copper it does not cut -----------------------------------
+// OMFEM's port rule (include/mvb/PortPlane.h), applied to the FEM product exactly as the mesher
+// meets it: for every "<conductor> terminal <k>" cap, h = the half-diagonal of the cap's bounding
+// box; the port face lies kPortPlaneInsetCaps h inside the cap (into the lead); every conductor
+// solid that does not cross that face must lie at least kPortPlaneGuardCaps h inside it. On the
+// two-switch forward (the corpus draw: --real --fem --segments 12, MVB_FAN_TERMINALS_ON_PLANE=1,
+// MVB_WELD_ALL=1) the Primary entrance Litz tip ended 0.6995 mm past the outermost Secondary
+// foil's copper, against the 0.7545 mm its 0.539 mm cap needs, and OMFEM refused the mesh. Bounding
+// boxes are AddOptimal (the true extent, not the pole hull): this measures the geometry.
+// Foil sheet ends and a foil lead's soldered end are joints, not ports: a cap touching another
+// conductor or solder body is skipped, as OMFEM now does, and so is a foil sheet's end cap (below).
+TEST_CASE("Real winding: every port plane clears the copper it does not cut -- two-switch forward (ABT #1400)",
+          "[realwinding][port]") {
+    ScopedEnv1403 plane("MVB_FAN_TERMINALS_ON_PLANE", "1");
+    ScopedEnv1403 weld("MVB_WELD_ALL", "1");
+    auto magneticJson = loadFixture("realwinding_two_switch_forward_litz_foil.json");
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+    mvb::MagneticBuilder builder;
+    const auto built = builder.buildAllNamed(enriched, /*includeBobbin=*/true, /*symmetryPlanes=*/0,
+                                             /*wirePolygonSegments=*/12, /*corePolygonSegments=*/12,
+                                             /*paintCoating=*/false, /*emitCoatingShells=*/false,
+                                             /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
+                                             /*useRealWindingGeometry=*/true, /*femReady=*/true);
+    REQUIRE_FALSE(built.empty());
+    auto boxOf = [](const TopoDS_Shape& s) {
+        Bnd_Box b;
+        BRepBndLib::AddOptimal(s, b, /*useTriangulation=*/false, /*useShapeTolerance=*/false);
+        std::array<double, 6> r{};
+        b.Get(r[0], r[1], r[2], r[3], r[4], r[5]);
+        return r;
+    };
+    struct Body { std::string name; TopoDS_Shape solid; std::array<double, 6> box; };
+    std::vector<Body> conductors, joints;   // conductor solids; conductor + solder bodies for contact
+    for (const auto& ns : built) {
+        if (ns.shape.IsNull() || ns.name.find(" terminal ") != std::string::npos) continue;
+        const bool solder = ns.role == mvb::Role::Solder;
+        const bool copper = ns.role == mvb::Role::Turn;
+        if (!solder && !copper) continue;
+        for (TopExp_Explorer e(ns.shape, TopAbs_SOLID); e.More(); e.Next()) {
+            if (copper) conductors.push_back({ns.name, e.Current(), boxOf(e.Current())});
+            joints.push_back({ns.name, e.Current(), boxOf(e.Current())});
+        }
+    }
+    REQUIRE(conductors.size() > 2);
+    size_t capsChecked = 0, jointsSkipped = 0;
+    double worstMargin = std::numeric_limits<double>::max();
+    for (const auto& ns : built) {
+        const auto at = ns.name.find(" terminal ");
+        if (at == std::string::npos || ns.shape.IsNull()) continue;
+        const std::string owner = ns.name.substr(0, at);
+        const auto cb = boxOf(ns.shape);
+        const double h = mvb::portCapHalfDiagonal(cb[0], cb[1], cb[2], cb[3], cb[4], cb[5]);
+        // A JOINT touches another body (OMFEM: exact contact within 1e-3 of the cap's own size).
+        bool joint = false;
+        for (const auto& b : joints) {
+            if (b.name == owner) continue;
+            BRepExtrema_DistShapeShape d(ns.shape, b.solid);
+            REQUIRE(d.IsDone());
+            if (d.Value() <= 1e-3 * h) { joint = true; break; }
+        }
+        if (joint) { ++jointsSkipped; continue; }
+        // A FOIL parallel is ONE body (ABT #1907): its sheet, its axial leads and the weld strips
+        // between them are fused, and its only caps are the lead tips -- the sheet's edges carry
+        // none, and no lead is a body of its own.
+        for (const auto& b : conductors) {
+            INFO("conductor '" << b.name << "'");
+            CHECK(b.name != owner + " entrance lead");
+            CHECK(b.name != owner + " exit lead");
+        }
+        // The cap's plane normal and the side it faces: the axis is the normal's dominant
+        // component; outward is away from its own conductor's bulk.
+        TopExp_Explorer fx(ns.shape, TopAbs_FACE);
+        REQUIRE(fx.More());
+        BRepAdaptor_Surface sf(TopoDS::Face(fx.Current()));
+        REQUIRE(sf.GetType() == GeomAbs_Plane);
+        const gp_Dir n = sf.Plane().Axis().Direction();
+        const double an[3] = {std::abs(n.X()), std::abs(n.Y()), std::abs(n.Z())};
+        const int axis = (an[0] >= an[1] && an[0] >= an[2]) ? 0 : (an[1] >= an[2] ? 1 : 2);
+        INFO("cap '" << ns.name << "' normal (" << n.X() << ", " << n.Y() << ", " << n.Z() << ")");
+        REQUIRE(an[axis] > 0.99);   // the 0.5 inset is the axis-aligned cap's
+        const double capC = 0.5 * (cb[axis] + cb[axis + 3]);
+        double ownLo = std::numeric_limits<double>::max(), ownHi = std::numeric_limits<double>::lowest();
+        for (const auto& b : conductors)
+            if (b.name == owner) { ownLo = std::min(ownLo, b.box[axis]); ownHi = std::max(ownHi, b.box[axis + 3]); }
+        REQUIRE(ownLo < ownHi);
+        const double s = (capC - ownLo) < (ownHi - capC) ? -1.0 : 1.0;   // outward sign on the axis
+        const double tip = s * capC;
+        const double portPlane = tip - mvb::kPortPlaneInsetCaps * h;
+        ++capsChecked;
+        for (const auto& b : conductors) {
+            double lo = s * b.box[axis], hi = s * b.box[axis + 3];
+            if (lo > hi) std::swap(lo, hi);
+            if (lo <= portPlane && hi >= portPlane) continue;   // crosses: the port face slices it
+            const double margin = (tip - hi) - mvb::portPlaneClearance(h);
+            if (margin < worstMargin)
+                std::fprintf(stderr, "[port-test] '%s' vs '%s': tip to copper %.6f mm, needs %.6f mm (h %.6f mm)\n",
+                             ns.name.c_str(), b.name.c_str(), (tip - hi) * 1e3,
+                             mvb::portPlaneClearance(h) * 1e3, h * 1e3);
+            worstMargin = std::min(worstMargin, margin);
+            INFO("'" << b.name << "' copper at " << hi * 1e3 << " mm, tip at " << tip * 1e3
+                     << " mm: tip to copper " << (tip - hi) * 1e3 << " mm against "
+                     << mvb::portPlaneClearance(h) * 1e3 << " mm (cap half-diagonal " << h * 1e3 << " mm)");
+            CHECK(margin >= 0.0);
+        }
+    }
+    std::fprintf(stderr, "[port-test] caps checked %zu, joints skipped %zu, "
+                         "worst margin %.6f mm\n", capsChecked, jointsSkipped,
+                 worstMargin * 1e3);
+    REQUIRE(capsChecked > 0);
+}
+
+// Under the FEM plane pin (MVB_FAN_TERMINALS_ON_PLANE, set by the 3-D mesher: the port is one
+// planar face) a block of parallels whose members do not all fit on the plane is refused by name.
+// It used to take the plane anyway: the member with no slot got a NaN azimuth, its wrap helix
+// started at NaN, and the clearance certificate spun until "box budget exhausted"
+// (14_dab_xfmr_pm8770_n97, corpus C2).
+TEST_CASE("Real winding: parallels that cannot all end on the FEM terminal plane are refused by name",
+          "[realwinding][terminal-plane]") {
+    std::ifstream f(std::string(MAS_EXAMPLES_DIR) + "/14_dab_xfmr_pm8770_n97.json");
+    REQUIRE(f.good());
+    const json mas = json::parse(f);
+    auto enriched = mvb::magnetic_autocomplete_safe(mas.at("magnetic"), /*useRealWindingGeometry=*/true);
+    REQUIRE(std::getenv("MVB_FAN_TERMINALS_ON_PLANE") == nullptr);
+    setenv("MVB_FAN_TERMINALS_ON_PLANE", "1", 1);
+    std::string error;
+    try {
+        mvb::MagneticBuilder builder;
+        builder.buildAllNamed(enriched, /*includeBobbin=*/false, /*symmetryPlanes=*/0,
+                              mvb::DEFAULT_WIRE_POLYGON_SEGMENTS, mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
+                              /*paintCoating=*/false, /*emitCoatingShells=*/false,
+                              /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
+                              /*useRealWindingGeometry=*/true, /*femReady=*/true);
+    } catch (const std::exception& e) {
+        error = e.what();
+    }
+    unsetenv("MVB_FAN_TERMINALS_ON_PLANE");
+    INFO(error);
+    CHECK(error.find("cannot all end on the terminal plane") != std::string::npos);
 }

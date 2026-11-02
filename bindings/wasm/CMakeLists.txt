@@ -100,6 +100,26 @@ set(INCLUDE_PYMKF     OFF CACHE BOOL "" FORCE)
 set(ENABLE_MATPLOTPP  OFF CACHE BOOL "" FORCE)
 set(ENABLE_NGSPICE    OFF CACHE BOOL "" FORCE)
 
+# ABT #852 — do NOT embed the finished-core inventory in the drawing engine.
+#
+# MKF's cmrc `data` archive is force-linked whole (see --whole-archive below), so every
+# catalog listed in MKF's DATA_LIST lands in the wasm DATA section whether it is read or
+# not. mvbpp DRAWS geometry; it never looks up a core part number: nothing in MVB++ or in
+# its bindings calls load_cores / find_core_by_name / get_core_shape_names(manufacturer),
+# and no adviser or cross-referencer (the only MKF callers of those) is reachable from a
+# draw entry point. The two inventory files are 9.48 MB of the engine — 19% of it — read
+# by nobody:
+#     MAS/data/cores.ndjson        8.20 MB
+#     MAS/data/cores_stock.ndjson  1.28 MB
+# Measured on the 2026-08-22 engine: 49.75 MB -> 40.27 MB raw (-19.0%), 10.52 -> 10.14 MB
+# gzipped, with byte-identical drawCore/drawTurns/drawMagnetic output on cm37 and the
+# tests/mas_complete_fixtures battery.
+#
+# The catalogs mvbpp DOES read stay embedded: core_shapes (Core::resolve_shape),
+# core_materials (Core::resolve_material), wires, wire_materials, bobbins and
+# insulation_materials all resolve name references in the MAS files the app hands us.
+set(EMBED_MAS_CORES OFF CACHE BOOL "" FORCE)
+
 # Overridable so the wasm module can be built against a fork or a local clone
 # (e.g. -D MVBPP_MKF_REPOSITORY=file:///path/to/MKF -D MVBPP_MKF_TAG=my-branch).
 # Defaults are unchanged: upstream MAS/MKF main.
@@ -140,6 +160,9 @@ FetchContent_Declare(
     GIT_SHALLOW    FALSE
     GIT_SUBMODULES ""
 )
+include(${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/MkfCheckout.cmake)
+# Take configure's own edits back out so the update step sees a clean checkout (see there).
+mvbpp_mkf_unplant("${_MKF_SRC}")
 FetchContent_GetProperties(MKF)
 if(NOT mkf_POPULATED)
     FetchContent_Populate(MKF)
@@ -178,15 +201,25 @@ add_library(mvb++ STATIC
     ${REPO_ROOT}/src/ProjectionDrawing.cpp
     ${REPO_ROOT}/src/SpacerBuilder.cpp
     ${REPO_ROOT}/src/FR4Builder.cpp
+    # ABT #1169's accessory builders: the fourth, fifth and sixth sources to reach the native
+    # build without this list. The guard below caught them at CONFIGURE this time, which is why
+    # the web engine has been stuck at 2026-08-23 rather than linking against a stale half.
+    ${REPO_ROOT}/src/BaseBuilder.cpp
+    ${REPO_ROOT}/src/PinBuilder.cpp
+    ${REPO_ROOT}/src/ShuntBuilder.cpp
     ${REPO_ROOT}/src/StepExporter.cpp
     ${REPO_ROOT}/src/Symmetry.cpp
     ${REPO_ROOT}/src/Utils.cpp
     ${REPO_ROOT}/src/TurnBuilder.cpp
     ${REPO_ROOT}/src/ConductorBuilder.cpp
+    ${REPO_ROOT}/src/TerminalFillet.cpp
+    ${REPO_ROOT}/src/WireAssembler.cpp
     ${REPO_ROOT}/src/BobbinBuilder.cpp
     ${REPO_ROOT}/src/shapes/ShapeBuilder.cpp
     ${REPO_ROOT}/src/shapes/ShapeDrum.cpp
     ${REPO_ROOT}/src/shapes/ShapeDrumRing.cpp
+    ${REPO_ROOT}/src/shapes/ShapeMolded.cpp
+    ${REPO_ROOT}/src/shapes/ShapeDrumSemishielded.cpp
     ${REPO_ROOT}/src/shapes/ShapeE.cpp
     ${REPO_ROOT}/src/shapes/ShapeEp.cpp
     ${REPO_ROOT}/src/shapes/ShapeEpx.cpp
@@ -202,21 +235,47 @@ add_library(mvb++ STATIC
     ${REPO_ROOT}/src/shapes/ShapeUi.cpp
     ${REPO_ROOT}/src/shapes/ShapeUr.cpp
     ${REPO_ROOT}/src/shapes/ShapeUt.cpp
+    ${REPO_ROOT}/src/shapes/ShapeSlab.cpp
     ${REPO_ROOT}/src/shapes/Factory.cpp
 )
 
-# This source list DUPLICATES the native build's, and it has now drifted TWICE -- once missing
-# ConductorBuilder.cpp (the wasm was unbuildable from main since June) and once missing
-# ShapeDrum.cpp (wasm-ld: "undefined symbol: vtable for mvb::shapes::ShapeDrum"). Both surfaced
-# only at LINK time, long after the source landed. Fail at CONFIGURE instead: every
-# src/shapes/*.cpp on disk must be listed above.
+# This source list DUPLICATES the native build's, and it has now drifted THREE times -- missing
+# ConductorBuilder.cpp (the wasm was unbuildable from main since June), then ShapeDrum.cpp
+# (wasm-ld: "undefined symbol: vtable for mvb::shapes::ShapeDrum"), then TerminalFillet.cpp
+# (undefined smoothLayerLinks / filletTerminalCorners). Every one surfaced only at LINK time,
+# long after the source landed.
+#
+# The third one got through a guard written to prevent exactly this, because that guard globbed
+# only src/shapes/*.cpp -- and TerminalFillet.cpp lives in src/. A guard narrower than the list
+# it protects gives false confidence: the configure passed, so the omission looked impossible.
+# So the glob is now RECURSIVE over every source the native build compiles.
+# MAS -> FEM mesh in the browser (ABT #1588): gmsh + MMG, same fork and options as native. Its
+# sources (src/mesh/) belong to mvbpp_mesh, so the guard below counts that target's list too.
+include(${CMAKE_CURRENT_SOURCE_DIR}/MvbMeshWasm.cmake)
 get_target_property(_mvb_wasm_srcs mvb++ SOURCES)
-file(GLOB _mvb_shape_srcs "${REPO_ROOT}/src/shapes/*.cpp")
-foreach(_s ${_mvb_shape_srcs})
+get_target_property(_mvb_mesh_wasm_srcs mvbpp_mesh SOURCES)
+list(APPEND _mvb_wasm_srcs ${_mvb_mesh_wasm_srcs})
+file(GLOB_RECURSE _mvb_all_srcs "${REPO_ROOT}/src/*.cpp")
+# Deliberately native-only sources, each with its reason. A listed file that no longer exists
+# stops the configure too, so an exception cannot outlive what it excuses.
+#  - StepAudit.cpp (ABT #1588 step 3): the CAD overlap audit runs its OCCT booleans in a fork()
+#    pool (waitpid); wasm has no fork. Only OMFEM's audit tools call it, never the mesher.
+set(_mvb_native_only "${REPO_ROOT}/src/mesh/StepAudit.cpp")
+foreach(_s ${_mvb_native_only})
+    if(NOT EXISTS "${_s}")
+        message(FATAL_ERROR "bindings/wasm/CMakeLists.txt excuses ${_s} as native-only, but it does not exist; drop the exception")
+    endif()
+endforeach()
+foreach(_s ${_mvb_all_srcs})
+    if("${_s}" IN_LIST _mvb_native_only)
+        continue()
+    endif()
     if(NOT "${_s}" IN_LIST _mvb_wasm_srcs)
         message(FATAL_ERROR
-            "bindings/wasm/CMakeLists.txt does not list ${_s}. Every src/shapes/*.cpp must appear "
-            "in the wasm mvb++ source list or the link fails with an undefined vtable.")
+            "bindings/wasm/CMakeLists.txt does not list ${_s}. Every src/**/*.cpp must appear in "
+            "the wasm mvb++ source list, or the link fails with an undefined symbol or vtable. "
+            "If a source is deliberately native-only, exclude it here explicitly rather than by "
+            "omission, so the intent is visible.")
     endif()
 endforeach()
 
@@ -231,13 +290,14 @@ target_include_directories(mvb++ PUBLIC
 )
 target_link_libraries(mvb++ PUBLIC occt MKF nlohmann_json::nlohmann_json)
 
+
 # ── WASM module ───────────────────────────────────────────────────────────────
 add_executable(mvbpp_wasm mvbpp_wasm.cpp)
 
 # cmrc embeds resources via static constructors in libdata.a.  When linking
 # static libraries the linker drops unreferenced object files, so the resource
 # initializers never run.  Force the entire archive so all cmrc files are kept.
-target_link_libraries(mvbpp_wasm PRIVATE mvb++)
+target_link_libraries(mvbpp_wasm PRIVATE mvb++ mvbpp_mesh)
 target_link_options(mvbpp_wasm PRIVATE
     "LINKER:--whole-archive"
     "$<TARGET_FILE:data>"
@@ -262,9 +322,10 @@ target_link_options(mvbpp_wasm PRIVATE
     "SHELL:-s MODULARIZE=1"
     "SHELL:-s EXPORT_NAME=createMvbpp"
     "SHELL:-s ALLOW_MEMORY_GROWTH=1"
-    # Growth stops at 2 GB unless this is raised. drawTurns on a round column needs about 14 MB
-    # per turn while it runs (16 segments; more at 32), and past the limit it dies with a bare
-    # "memory access out of bounds". 4 GB is the most a wasm32 memory can hold.
+    # Meshing a real magnetic peaks around 1.5 GB (15_gan, native RSS) -- past emscripten's
+    # 2 GB growth cap once wasm overheads are added. wasm32 addresses up to 4 GB.
+    # drawTurns on a round column also needs about 14 MB per turn while it runs (16 segments; more
+    # at 32), and past the 2 GB cap it dies with a bare "memory access out of bounds".
     "SHELL:-s MAXIMUM_MEMORY=4GB"
     "SHELL:-s INITIAL_MEMORY=256MB"
     "SHELL:-s STACK_SIZE=8MB"

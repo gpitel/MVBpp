@@ -1,6 +1,8 @@
 #include "mvb/SectionDrawing.h"
 #include "mvb/SectionBuilder.h"
 #include "mvb/MagneticBuilder.h"
+#include "mvb/SpacerBuilder.h"   // ABT #1170
+#include "mvb/ShuntBuilder.h"    // ABT #1176
 #include "mvb/Utils.h"
 #include "constructive_models/Magnetic.h"
 
@@ -707,6 +709,18 @@ static std::string drawDimensionedViewImpl(const OpenMagnetics::Magnetic& magnet
     auto pieces = builder.buildCoreNamed(magnetic.get_core(), corePolygonSegments);
     if (pieces.empty()) throw std::runtime_error("SectionDrawing: no core pieces built");
 
+    // ABT #1170 (WP1): the plastic shims of an additive-gapped set. They are what HOLDS the
+    // two half-sets apart, so a front section that omits them shows the halves floating with
+    // an unexplained gap between them. They are kept OUT of `pieces`: the TOP view picks a
+    // single representative half-set out of that list by its Y bound, and a shim (which
+    // straddles y = 0) must not be able to win that pick.
+    std::vector<NamedShape> spacers;
+    appendSpacerSolids(spacers, magnetic.get_core());
+    // ABT #1176 (WP7): the magnetic shunts, validated by MKF exactly as the 3D assembly does.
+    // Sectioned on their own (not fused) in the FRONT view so a sheet held inside a shimmed gap
+    // keeps its outline instead of merging into the shim's.
+    const auto shunts = ShuntBuilder::buildShuntsNamed(magnetic);
+
     // Sample edges → polylines in mm; collect bbox.
     std::vector<std::vector<std::pair<double,double>>> polylines;
     double xmin = +1e30, xmax = -1e30, ymin = +1e30, ymax = -1e30;
@@ -775,6 +789,13 @@ static std::string drawDimensionedViewImpl(const OpenMagnetics::Magnetic& magnet
             BRepAlgoAPI_Fuse fuser(core, pieces[i].shape);
             if (fuser.IsDone()) core = fuser.Shape();
         }
+        // ABT #1170: fuse the shims in for the FRONT section only (see above). Their
+        // rectangles then come out of the same sectioning pass as the core's, so they land in
+        // the same projection, the same units and the same bbox as everything else.
+        for (const auto& s : spacers) {
+            BRepAlgoAPI_Fuse fuser(core, s.shape);
+            if (fuser.IsDone()) core = fuser.Shape();
+        }
         if (isToroidalCore) {
             // Section perpendicular to the hole axis (Y) → the XZ plane cuts the
             // outer and inner cylindrical walls in two concentric circles.
@@ -789,6 +810,14 @@ static std::string drawDimensionedViewImpl(const OpenMagnetics::Magnetic& magnet
             auto edges = SectionBuilder::sectionCore(core, SectionPlane::XY);
             if (edges.IsNull()) throw std::runtime_error("SectionDrawing: front section returned nothing");
             collectEdges(edges, ViewKind::FRONT);
+            for (const auto& shunt : shunts) {
+                auto shuntEdges = SectionBuilder::sectionCore(shunt.shape, SectionPlane::XY);
+                // Null only when the boolean failed; a sheet that does not reach z = 0 sections
+                // to an empty compound and simply draws nothing.
+                if (shuntEdges.IsNull())
+                    throw std::runtime_error("SectionDrawing: front section of " + shunt.name + " failed");
+                collectEdges(shuntEdges, ViewKind::FRONT);
+            }
         }
     } else if (view == ViewKind::TOP && [&]{
                   auto geo = magnetic.get_core().get_geometrical_description();

@@ -1,4 +1,6 @@
 #include "mvb/Utils.h"
+#include "mvb/ConductorBuilder.h"   // the bend policy MKF is told about (ABT #1172)
+#include "mvb/WireAssembler.h"
 #include <algorithm>
 #include <vector>
 #include <BRepBuilderAPI_MakeEdge.hxx>
@@ -29,6 +31,7 @@
 #include <variant>
 #include <stdexcept>
 #include <sstream>
+#include <iostream>
 #include <numbers>
 #include <map>
 
@@ -39,6 +42,21 @@
 #include "support/Utils.h"
 
 namespace mvb {
+
+namespace {
+
+// The families MKF's Core constructor makes PIECE_AND_PLATE: a shaped piece closed by a plate,
+// ring or shell, not by a mirrored half. MKF main spells this list inline and has no helper for
+// it (Core::is_piece_and_plate_family lived only on the double-coil branch), so keep it in step
+// with Core.cpp's constructor cascade by hand.
+bool is_piece_and_plate_family(MAS::CoreShapeFamily family) {
+    return family == MAS::CoreShapeFamily::UI || family == MAS::CoreShapeFamily::PQI ||
+           family == MAS::CoreShapeFamily::UT || family == MAS::CoreShapeFamily::EI ||
+           family == MAS::CoreShapeFamily::DRUM_RING || family == MAS::CoreShapeFamily::DRUM_SEMISHIELDED ||
+           family == MAS::CoreShapeFamily::DRUM_PLATE;
+}
+
+}  // namespace
 
 double flatten_dimension(const MAS::Dimension& dim) {
     if (std::holds_alternative<MAS::DimensionWithTolerance>(dim)) {
@@ -68,27 +86,48 @@ std::map<std::string, double> flatten_dimensions(const std::map<std::string, MAS
     return result;
 }
 
-TopoDS_Wire build_polygon_circle(double radius, int segments) {
+double require_dimension(const std::map<std::string, double>& dims,
+                         const std::string& key,
+                         const std::string& shapeName) {
+    auto it = dims.find(key);
+    if (it == dims.end()) {
+        throw std::runtime_error("shape '" + shapeName + "' has no dimension " + key
+                                 + ", which its profile cannot be built without");
+    }
+    if (!(it->second > 0.0)) {
+        throw std::runtime_error("shape '" + shapeName + "' has dimension " + key + " = "
+                                 + std::to_string(it->second)
+                                 + ", which its profile cannot be built from");
+    }
+    return it->second;
+}
+
+TopoDS_Wire build_polygon_circle(double radius, int segments, bool circumscribed) {
     if (segments <= 0) {
         gp_Circ circ(gp_Ax2(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1)), radius);
         BRepBuilderAPI_MakeEdge edge(circ);
         BRepBuilderAPI_MakeWire wire(edge);
         return wire.Wire();
     }
+    // Circumscribed: apothem = radius, so every chord stays at or beyond the nominal
+    // circle and a carved void contains the nominal void (see Utils.h faceting rule).
+    double vertexRadius =
+        circumscribed ? radius / std::cos(std::numbers::pi / segments) : radius;
     BRepBuilderAPI_MakePolygon poly;
     for (int i = 0; i < segments; ++i) {
         double angle = 2.0 * std::numbers::pi * i / segments;
-        poly.Add(gp_Pnt(radius * std::cos(angle), radius * std::sin(angle), 0.0));
+        poly.Add(gp_Pnt(vertexRadius * std::cos(angle), vertexRadius * std::sin(angle), 0.0));
     }
     poly.Close();
     return BRepBuilderAPI_MakeWire(poly.Wire()).Wire();
 }
 
-TopoDS_Shape build_polygon_cylinder(double height, double radius, int segments) {
+TopoDS_Shape build_polygon_cylinder(double height, double radius, int segments,
+                                    bool circumscribed) {
     if (segments <= 0) {
         return BRepPrimAPI_MakeCylinder(radius, height).Shape();
     }
-    TopoDS_Wire wire = build_polygon_circle(radius, segments);
+    TopoDS_Wire wire = build_polygon_circle(radius, segments, circumscribed);
     BRepBuilderAPI_MakeFace face(wire);
     gp_Vec vec(0, 0, height);
     return BRepPrimAPI_MakePrism(face.Face(), vec).Shape();
@@ -251,6 +290,25 @@ OpenMagnetics::Magnetic magnetic_autocomplete_safe(const nlohmann::json& magneti
         &OpenMagnetics::Settings::set_coil_use_real_winding_geometry,
         useRealWindingGeometry);
 
+    // ABT #1172/#1237: MKF plans a pin run's corners as straight legs meeting at an obstacle edge,
+    // and offsets each leg for the bend radius the CONSUMER will draw (d >= R - (R - r) sin(theta/2),
+    // Settings::lead_leg_clearance). Unset, MKF plans SHARP corners (R = r) and any rounded corner
+    // then cuts the edge -- measured as copper inside the pin rail on the boost PQ 26/25. MVB++ is
+    // that consumer and rounds every corner, so it declares its own bend policy here: the corner
+    // rule (kRoundCornerBendFactor) and the user's minimum-bend floor, the same two numbers
+    // ConductorBuilder::Options draws with. MKF is told; it never guesses.
+    OpenMagnetics::SettingsGuard<std::optional<double>> leadBendFactorGuard(
+        OpenMagnetics::Settings::GetInstance(),
+        &OpenMagnetics::Settings::get_coil_lead_bend_radius_factor,
+        &OpenMagnetics::Settings::set_coil_lead_bend_radius_factor,
+        std::optional<double>(mvb::kRoundCornerBendFactor));
+    const double minBend = mvb::ConductorBuilder::Options().minBendRadius;
+    OpenMagnetics::SettingsGuard<std::optional<double>> leadBendMinimumGuard(
+        OpenMagnetics::Settings::GetInstance(),
+        &OpenMagnetics::Settings::get_coil_lead_minimum_bend_radius,
+        &OpenMagnetics::Settings::set_coil_lead_minimum_bend_radius,
+        minBend > 0 ? std::optional<double>(minBend) : std::nullopt);
+
     json coreJson = magneticJson.contains("core") ? magneticJson.at("core") : json::object();
 
     // Construct OpenMagnetics::Core and Coil directly from JSON.
@@ -304,7 +362,7 @@ OpenMagnetics::Magnetic magnetic_autocomplete_safe(const nlohmann::json& magneti
         auto shapeFamily = mutCore.get_shape_family();
         if (shapeFamily == MAS::CoreShapeFamily::T) {
             mutCore.get_mutable_functional_description().set_type(MAS::CoreType::TOROIDAL);
-        } else if (OpenMagnetics::Core::is_piece_and_plate_family(shapeFamily)) {
+        } else if (is_piece_and_plate_family(shapeFamily)) {
             // A UI or PQI core is one piece closed by a flat plate, never a mirrored pair.
             // Stamping TWO_PIECE_SET here sent process_data down its mirrored-pair branch,
             // which DOUBLES the column height, winding-window height and area, le and
@@ -329,7 +387,79 @@ OpenMagnetics::Magnetic magnetic_autocomplete_safe(const nlohmann::json& magneti
         return om;
     }
 
+    // ABT #685 (Alf, 2026-08-16): opt-in fit relaxations for diagnostic/test flows. Default
+    // off, like the MKF settings themselves; MVB_ALLOW_SQUISH turns both on so over-full
+    // examples wind WITH blocking (bulging radially) instead of declining it.
+    OpenMagnetics::SettingsGuard<bool> squishGuard(
+        OpenMagnetics::Settings::GetInstance(),
+        &OpenMagnetics::Settings::get_coil_allow_coating_squish,
+        &OpenMagnetics::Settings::set_coil_allow_coating_squish,
+        std::getenv("MVB_ALLOW_SQUISH") != nullptr);
+    OpenMagnetics::SettingsGuard<bool> overflowGuard(
+        OpenMagnetics::Settings::GetInstance(),
+        &OpenMagnetics::Settings::get_coil_allow_horizontal_overflow,
+        &OpenMagnetics::Settings::set_coil_allow_horizontal_overflow,
+        std::getenv("MVB_ALLOW_SQUISH") != nullptr);
     auto enriched = OpenMagnetics::magnetic_autocomplete(om, json{});
+    // ABT #685 (Alf, 2026-08-16): a layout whose real-winding blocking was DECLINED (the ABT
+    // #650 gate: ideal wind does not fit) has turns sitting inside the connection corridors —
+    // building it can only end in a gate collision that reads as a 3D bug. Refuse with the
+    // real reason instead (no-fallbacks rule: the broken thing is named, not routed around).
+    if (useRealWindingGeometry &&
+        !enriched.get_coil().is_real_winding_blocking_applied()) {
+        // ABT #869: blocking is also absent for a reason that has nothing to do with fit. Real
+        // winding is not implemented for PLANAR (PCB) constructions — MKF's own ruling (ABT
+        // #492): magnetic_autocomplete deliberately does not re-wind a planar coil when the flag
+        // is on, so the flag simply never gets set and the design arrives here indistinguishable
+        // from an over-full one. Saying "the ideal wind does not fit its window" about a planar
+        // transformer sends the reader hunting a fit problem that does not exist (it cost
+        // 09_planar_xfmr_er2510_3c94 a slot in the #869 fit class). Name the real reason.
+        if (enriched.get_mutable_coil().is_planar()) {
+            throw std::runtime_error(
+                "magnetic_autocomplete_safe: real winding geometry was requested for a PLANAR "
+                "(PCB) construction, which MKF does not implement (ABT #492: leads, connection "
+                "blocking and lead routing are for wound magnetics only). This is not a fit "
+                "problem — the layout is fine; there is no real-winding model for it. Build it "
+                "without --real, or implement planar real winding in MKF first.");
+        }
+        throw std::runtime_error(
+            "magnetic_autocomplete_safe: real winding geometry was requested but MKF did NOT "
+            "apply connection blocking (the ideal wind does not fit its window — see MKF's "
+            "coil log / MKF_BLOCKING_DIAG). The layout has turns inside the connection "
+            "corridors and cannot be built as FEM-grade CAD. Fix the design data, or set "
+            "MVB_ALLOW_SQUISH=1 (diagnostic) to allow coating squish and horizontal overflow.");
+    }
+    // ABT #864: the OTHER half of that contract. Blocking can be APPLIED and the BLOCKED layout
+    // still not fit — the fixpoint grows layers until the winding walks radially out of the
+    // window (13_current_sense: the 1-turn fat primary's two terminal leads reserve ~0.53 mm at
+    // BOTH edges of every secondary layer, capacity 16 -> 4 turns/layer, 80 turns -> 20 layers,
+    // copper at x=4.69 mm past the CORE edge 4.675 in a window ending at 3.8125). wind() returns
+    // false for such a coil, but magnetic_autocomplete discards that bool, and the flag above is
+    // latched from the IDEAL verdict before the blocking loop grows anything — so the only
+    // signal died silently and the certified gate cannot see it (the displaced turns clear each
+    // OTHER). Re-derive the final fit verdict here and refuse with MKF's own named reason.
+    // ABT #864 amendment (Alf, 2026-08-24: "it's a bad design, but a possible one; if it
+    // spreads and collides with the core we must show the user so he knows, but the coil is
+    // correct — though really inefficient"). A blocked layout that does not fit its window is
+    // BUILT, not refused: the coil itself is legal winding data, and the user must SEE the
+    // copper leave the window/core to judge the design. The verdict still cannot pass silently
+    // (that silence is what #864 was about), so it is said out loud here with MKF's own named
+    // reason, and the build proceeds.
+    if (useRealWindingGeometry) {
+        auto& enrichedCoil = enriched.get_mutable_coil();
+        const bool layoutFits = enrichedCoil.are_sections_and_layers_fitting();
+        const bool copperInside = enrichedCoil.are_turns_inside_winding_window();
+        if (!layoutFits || !copperInside) {
+            std::cerr << "[magnetic_autocomplete_safe] WARNING (ABT #864): the real-winding "
+                         "BLOCKED layout does not fit its winding window ("
+                      << (enrichedCoil._lastFitFailure.empty() ? std::string("unnamed fit failure")
+                                                               : enrichedCoil._lastFitFailure)
+                      << "). Building it anyway so the overflow is visible — the design is "
+                         "legal but cannot hold its turns plus the connection corridors inside "
+                         "the window; expect copper outside the window (possibly outside the "
+                         "core)." << std::endl;
+        }
+    }
 
     // No-fallbacks rule: if the design has windings but MKF produced zero
     // turnsDescription (typically because the winding does not fit the

@@ -2,6 +2,8 @@
 #include "mvb/shapes/ShapeC.h"
 #include "mvb/shapes/ShapeDrum.h"
 #include "mvb/shapes/ShapeDrumRing.h"
+#include "mvb/shapes/ShapeMolded.h"
+#include "mvb/shapes/ShapeDrumSemishielded.h"
 #include "mvb/shapes/ShapeE.h"
 #include "mvb/shapes/ShapeEp.h"
 #include "mvb/shapes/ShapeLp.h"
@@ -12,6 +14,7 @@
 #include "mvb/shapes/ShapePm.h"
 #include "mvb/shapes/ShapePQ.h"
 #include "mvb/shapes/ShapeRM.h"
+#include "mvb/shapes/ShapeSlab.h"
 #include "mvb/shapes/ShapeT.h"
 #include "mvb/shapes/ShapeU.h"
 #include "mvb/shapes/ShapeUi.h"
@@ -42,6 +45,12 @@ std::unique_ptr<ShapeBuilder> createShapeBuilder(MAS::CoreShapeFamily family,
         case MAS::CoreShapeFamily::EER:  // ABT #265: ER-type with round centre leg
         case MAS::CoreShapeFamily::PLANAR_ER:
             builder = std::make_unique<ShapeEr>(); break;
+        case MAS::CoreShapeFamily::DRUM_SEMISHIELDED:  // ABT #362: drum; the epoxy shell is a coating
+            builder = std::make_unique<ShapeDrumSemishielded>();
+            break;
+        case MAS::CoreShapeFamily::MOLDED:  // ABT #357: SMC block moulded around the coil
+            builder = std::make_unique<ShapeMolded>();
+            break;
         case MAS::CoreShapeFamily::T:
             builder = std::make_unique<ShapeT>(); break;
         case MAS::CoreShapeFamily::DRUM:
@@ -82,6 +91,14 @@ std::unique_ptr<ShapeBuilder> createShapeBuilder(MAS::CoreShapeFamily family,
             builder = std::make_unique<ShapePQ>(); break;
         case MAS::CoreShapeFamily::RM:
             builder = std::make_unique<ShapeRM>(); break;
+        // Slab cores (MKF CorePieceSlab, ABT #263): pot cores with two flats.
+        case MAS::CoreShapeFamily::DS:
+        case MAS::CoreShapeFamily::HS:
+            builder = std::make_unique<ShapeSlab>(); break;
+        // RS (ABT #1443): a slab half paired with a plain pot round. The RS piece is the slab;
+        // buildCoreShapes draws a set's bottom half with ShapeRs::buildRoundHalf (see ShapeSlab.h).
+        case MAS::CoreShapeFamily::RS:
+            builder = std::make_unique<ShapeRs>(); break;
         default:
             return nullptr;
     }

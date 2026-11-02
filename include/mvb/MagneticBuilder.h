@@ -1,7 +1,10 @@
 #pragma once
+#include <limits>
+#include <optional>
 
 #include "MAS.hpp"
 #include "Utils.h"
+#include "mvb/ConductorBuilder.h"
 #include "mvb/NamedShape.h"
 #include "mvb/Symmetry.h"
 #include <TopoDS_Shape.hxx>
@@ -24,10 +27,10 @@ struct DrawConfig {
     int         symmetryPlanes        = 0;       // 0=full, 1=half, 2=quarter
     int         wirePolygonSegments    = DEFAULT_WIRE_POLYGON_SEGMENTS;
     int         corePolygonSegments    = DEFAULT_CORE_POLYGON_SEGMENTS;
-    // true  → turns drawn at the OUTER (insulation) diameter (visualisation).
-    // false → turns drawn at the CONDUCTING (copper) diameter — required for
-    //         FEM winding-loss meshing (LITZ → bare bundle as a solid).
-    bool        paintCoating           = true;
+    // true  → turns drawn at the OUTER (insulation) diameter (the web viewer).
+    // false → turns drawn at the CONDUCTING (copper) diameter — DEFAULT (ABT #1261),
+    //         and what FEM winding-loss meshing requires (LITZ → bare bundle as a solid).
+    bool        paintCoating           = false;
     // true → real winding: ONE continuous conductor per (winding, parallel) instead of
     //        independent per-turn loops; MKF enriches with real-winding turn blocking on.
     bool        useRealWindingGeometry = false;
@@ -35,6 +38,16 @@ struct DrawConfig {
     // true (FEM export) → the slow one-piece/conformal machinery: single body per parallel where a
     // sweep closes, a mitre-jointed conformal compound for dense toroids. Meshable but far slower.
     bool        femReady               = false;
+    // Minimum radius for ANY drawn corner/fillet, metres; 0 = each site's policy radius.
+    // Floors, never tightens (see ConductorBuilder::Options::minBendRadius).
+    double      minBendRadius          = 0.0;
+    // Real-winding only: how each conductor's pieces are welded (WeldMode, WireAssembler.h).
+    // Unset = the builder's own mode (MagneticBuilder::setWeldMode), else the environment's.
+    std::optional<WeldMode> weld;
+    // Real-winding only: the style of every terminal-lead corner (ConductorBuilder::Options::
+    // roundedLeadCorners): true round fillets, false sharp mitres. Unset = the builder's own
+    // (MagneticBuilder::setRoundedLeadCorners), else round.
+    std::optional<bool> roundedLeadCorners;
 };
 
 class MagneticBuilder {
@@ -93,11 +106,11 @@ public:
     std::vector<NamedShape> buildTurnsNamed(const MAS::Coil& coil,
                                             const MAS::MagneticCore& core,
                                             int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS,
-                                            bool paintCoating = true) const;
+                                            bool paintCoating = false) const;
     std::vector<NamedShape> buildTurnsNamed(const OpenMagnetics::Coil& coil,
                                             const MAS::MagneticCore& core,
                                             int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS,
-                                            bool paintCoating = true) const;
+                                            bool paintCoating = false) const;
     NamedShape buildBobbinNamed(const MAS::Coil& coil,
                                 const MAS::MagneticCore& core,
                                 int corePolygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS) const;
@@ -118,30 +131,125 @@ public:
     // through MKF with its real-winding turn blocking on. A magnetic that already carries a
     // geometricalDescription THROWS with the flag on — MKF must (re-)wind; caller-provided
     // turn positions are never silently re-interpreted.
+    // Real-winding conductor CENTRELINES (sampled, collision-checked, seam-aimed), for
+    // implicit/level-set winding meshing. No solids are built. See
+    // ConductorBuilder::PathPolyline.
+    // ABT #1248: a toroid's centrelines are returned in the EXPORTED frame (the frame
+    // buildAllNamed's assembly and its STEP are in), so their terminal tips and directions are the
+    // caps OMFEM sees. Other cores are unaffected.
+    std::vector<ConductorBuilder::PathPolyline> buildRealWindingPaths(
+        const OpenMagnetics::Magnetic& magnetic) const;
+
+    // ---- ABT #1248: toroid mounting ------------------------------------------------------------
+    // The mounting a toroid is built with: its bobbin's base.mounting when the bobbin is a toroid
+    // base, otherwise MKF Settings toroid_mounting (default VERTICAL). Throws for a non-toroid.
+    static ConductorBuilder::ToroidMounting toroidMountingOf(const OpenMagnetics::Magnetic& magnetic);
+    static ConductorBuilder::ToroidMounting toroidMountingOf(const MAS::Magnetic& magnetic);
+    // The full frame (mounting, build-frame lead direction, build -> exported rigid motion).
+    // The magnetic must carry its wound turns (see ConductorBuilder::resolveToroidMountingFrame).
+    static ConductorBuilder::ToroidMountingFrame toroidMountingFrameOf(
+        const OpenMagnetics::Magnetic& magnetic);
+    static ConductorBuilder::ToroidMountingFrame toroidMountingFrameOf(const MAS::Magnetic& magnetic);
+
+    // ---- ABT #1215: terminal-lead copper length per winding ------------------------------
+    // ABT #1248: a toroid's lead piece endpoints are in the exported frame, like the paths.
+    // The lead copper the real-winding conductors carry beyond their turns, measured on the
+    // finished centreline (see ConductorBuilder::measureTerminalLeadLengths for exactly which
+    // primitives count and how they are split into entrance/exit). Pass the SAME settings the
+    // conductors are built with -- buildAllNamed(..., paintCoating, ..., coreCoatingThickness,
+    // useRealWindingGeometry=true, femReady) -- because the bend radii follow the drawn wire
+    // radius and femReady decides which corners are filleted. With emitCoatingShells the
+    // conductor that carries current is the bare one: pass paintCoating=false.
+    // The magnetic must already be enriched through MKF's real-winding autocomplete.
+    // Runs the conductor path planning once more (no solids), so it costs a fraction of a build.
+    std::map<std::string, ConductorBuilder::TerminalLeadLength> measureTerminalLeadLengths(
+        const OpenMagnetics::Magnetic& magnetic,
+        bool paintCoating = false,
+        bool femReady = true,
+        int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS,
+        int corePolygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS,
+        double coreCoatingThickness = 0.0) const;
+    // {"winding_<name>": {"terminal_lead_length_m": x, "parallels": n,
+    //                     "ends": [{"parallel": k, "end": "entrance"|"exit", "length_m": l,
+    //                               "pieces": [{"label", "kind", "length_m", "start_m", "end_m",
+    //                                           "radius_m", "sweep_rad"}, ...]}, ...]}}
+    static nlohmann::json terminalLeadLengthsToJson(
+        const std::map<std::string, ConductorBuilder::TerminalLeadLength>& leads);
+    // The sidecar sits next to the STEP with the extension swapped: out/design.step ->
+    // out/design.leads.json. Returns the path written; throws when it cannot be written.
+    static std::string terminalLeadSidecarPath(const std::string& stepPath);
+    static std::string writeTerminalLeadSidecar(
+        const std::map<std::string, ConductorBuilder::TerminalLeadLength>& leads,
+        const std::string& stepPath);
+
+    // The core-coating thickness to DRAW for this core, in metres, or 0 for "no coating layer".
+    //
+    // Only a coating the design DECLARES is drawn. MKF's Core::get_coating_thickness() also
+    // invents a default jacket for any uncoated toroid -- right for the winding-to-core
+    // dielectric path it exists for, wrong to put on screen for a design whose author never
+    // mentioned a coating. Presence is decided from functionalDescription.coating; the
+    // thickness itself is still resolved by MKF, which is what turns the name-only form
+    // ("epoxy") into a datasheet number.
+    //
+    // MAGNETIC_EPOXY returns 0: that is the powder-loaded shield cap moulded over the WINDING
+    // of a semishielded drum, drawn separately (and translucently) by drawCoreShell, not an
+    // insulating jacket on the ferrite surface.
+    //
+    // Public because every entry point that assembles a magnetic has to make the same call --
+    // drawMagnetic here, and the WASM/Python bindings, which reach buildAllNamed directly and
+    // are what every 3D viewer actually goes through.
+    static double declaredCoreCoatingThickness(const MAS::MagneticCore& core);
+
+    // The coating layer itself: the core surface offset outward by `thickness`, minus the
+    // core, i.e. a uniform-thickness conformal wrap (outer, inner, top and bottom). Returns a
+    // null shape when the offset or the cut fails -- a sharp-cornered core OCCT cannot offset
+    // -- and the caller then draws nothing rather than fabricating a layer.
+    //
+    // Public for the same reason: the 3D viewers do not call drawMagnetic, they compose the
+    // assembly from drawCore / drawCoreShell / drawBobbin / drawTurns, so the coating has to
+    // be reachable as its own product.
+    static TopoDS_Shape buildCoreCoatingShell(const TopoDS_Shape& core, double thickness);
+
     std::vector<NamedShape> buildAllNamed(const MAS::Magnetic& magnetic,
                                           bool includeBobbin = true,
                                           int symmetryPlanes = 0,
                                           int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS,
                                           int corePolygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS,
-                                          bool paintCoating = true,
+                                          bool paintCoating = false,
                                           bool emitCoatingShells = false,
                                           bool includeInsulation = false,
                                           double coreCoatingThickness = 0.0,
                                           bool useRealWindingGeometry = false,
-                                          bool femReady = false) const;
+                                          bool femReady = false,
+                                          bool skipGeometryChecks = false,
+                                          // Non-null: receives the enamel gate's verdict over the
+                                          // real-winding conductors of THIS call (see
+                                          // EnamelGateVerdict). NotRun when no gate ran (no real
+                                          // winding, or the build threw).
+                                          EnamelGateVerdict* enamelGateVerdictOut = nullptr) const;
     std::vector<NamedShape> buildAllNamed(const OpenMagnetics::Magnetic& magnetic,
                                           bool includeBobbin = true,
                                           int symmetryPlanes = 0,
                                           int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS,
                                           int corePolygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS,
-                                          bool paintCoating = true,
+                                          bool paintCoating = false,
                                           bool emitCoatingShells = false,
                                           bool includeInsulation = false,
                                           // >0: build the core's insulating coating as a conformal
                                           // shell solid ("<core> coating") of this thickness [m].
                                           double coreCoatingThickness = 0.0,
                                           bool useRealWindingGeometry = false,
-                                          bool femReady = false) const;
+                                          bool femReady = false,
+                                          // A VIEWER's geometry, not a part (the WASM/web build):
+                                          // skips the collision, containment and enamel-clearance
+                                          // proofs over the drawn copper. They are what makes a
+                                          // build trustworthy and most of what makes it slow; a
+                                          // picture on screen needs neither. Every consumer that
+                                          // exports a part leaves this false, and the builder says
+                                          // out loud when it is set.
+                                          bool skipGeometryChecks = false,
+                                          // See the MAS overload.
+                                          EnamelGateVerdict* enamelGateVerdictOut = nullptr) const;
 
     // ---- Standalone builders for the unified bindings API -----------------
     //
@@ -172,6 +280,111 @@ public:
         const std::vector<MAS::Turn>& turns,
         int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS,
         bool paintCoating = true) const;
+
+    // Turns ONLY, in real-winding form: one continuous copper body per (winding, parallel),
+    // with the real leads, pitch and dragbacks. The turns-only counterpart of
+    // buildAllNamed(..., useRealWindingGeometry=true), for a consumer that draws core,
+    // bobbin and turns as SEPARATE meshes (the web 3D viewer, which colours and toggles
+    // them independently) and so cannot use the single-call assembly.
+    //
+    // The magnetic must already be enriched through MKF's real-winding autocomplete —
+    // same precondition as buildAllNamed with the flag on. The core is built internally
+    // (not returned) because the conductor builder aims the terminal leads at the real
+    // window opening; see buildRealWindingConductorsNamed.
+    //
+    // diagnosticSkipCollisionCheck builds the conductors even when two of them overlap, so
+    // the overlap can be LOOKED AT instead of only read about in an exception; every collision
+    // refusal is printed to stderr as a finding (see ConductorBuilder::Options). The result is
+    // interpenetrating copper: a picture, never a part. Tools and tests investigating a
+    // specific refusal only — nothing in the library sets it.
+    std::vector<NamedShape> buildRealWindingTurnsNamed(
+        const OpenMagnetics::Magnetic& magnetic,
+        int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS,
+        int corePolygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS,
+        bool paintCoating = false,
+        bool femReady = false,
+        bool diagnosticSkipCollisionCheck = false) const;
+
+    // ---- ABT #1169 (WP0): the accessory-solid attachment point ------------------------
+    //
+    // Everything a real magnetic carries that is neither a core piece nor a conductor:
+    // core spacers (WP1), bobbin dividers and pins (WP2/WP4), magnetic shunts (WP6), lead
+    // sleeves (WP7), a toroid base (WP4). Those work packages add their builders HERE and
+    // nowhere else, so the whole assembly, the STEP export, the 2D sections and the OMFEM
+    // meshers all pick them up from one place.
+    //
+    // Called once from each buildAllNamed overload, immediately after the bobbin block.
+    // Names must follow D2 of the manufacturing-fidelity proposal ("Spacer_<i>",
+    // "<bobbin> pin <name>", "<bobbin> divider <i>", "Shunt_<i>",
+    // "<winding> parallel <p> <entrance|exit> sleeve", "<bobbin> base") because names are
+    // the only channel that survives the STEP round-trip into OMFEM's classify(); each
+    // solid must also carry its Role. A solid that overlaps the former (a divider, a pin)
+    // has to be added to the bobbin cutter list in buildAllNamed as well — the bobbin is
+    // already cut by the time this runs.
+    //
+    // Empty in WP0 on purpose: the hook lands with the strict classifier so that the first
+    // accessory to be drawn cannot be silently meshed as core.
+    struct AccessoryOptions {
+        bool includeBobbin          = false;
+        int  wirePolygonSegments    = DEFAULT_WIRE_POLYGON_SEGMENTS;
+        int  corePolygonSegments    = DEFAULT_CORE_POLYGON_SEGMENTS;
+        bool paintCoating           = false;
+        bool useRealWindingGeometry = false;
+        bool femReady               = false;
+        // ABT #1173 (WP4): the real-winding toroid terminal plane of the conductors this assembly
+        // drew (ConductorBuilder::Options::toroidTerminalPlaneOut); NaN when there is none. A
+        // toroid base is drawn with its top face on it (BaseBuilder.h).
+        double toroidTerminalPlaneY = std::numeric_limits<double>::quiet_NaN();
+    };
+    void appendAccessorySolids(std::vector<NamedShape>& all,
+                               const MAS::Magnetic& magnetic,
+                               const AccessoryOptions& opts) const;
+    void appendAccessorySolids(std::vector<NamedShape>& all,
+                               const OpenMagnetics::Magnetic& magnetic,
+                               const AccessoryOptions& opts) const;
+
+    // How every real-winding conductor this builder draws is welded (WeldMode, WireAssembler.h):
+    // Off ships each conductor as its abutting pieces, Auto welds where a junction overlaps and
+    // closes the conductor into one body, All welds every junction. Unset (the default) leaves
+    // ConductorBuilder::Options' own default, which follows MVB_WELD_ALL.
+    void setWeldMode(WeldMode mode) { weldMode_ = mode; }
+    std::optional<WeldMode> weldMode() const { return weldMode_; }
+    // Whether every terminal-lead corner of a real-winding conductor is a round fillet (true) or a
+    // sharp mitre (false); see ConductorBuilder::Options::roundedLeadCorners. Unset (the default)
+    // leaves the Options' own default, round.
+    void setRoundedLeadCorners(bool rounded) { roundedLeadCorners_ = rounded; }
+    std::optional<bool> roundedLeadCorners() const { return roundedLeadCorners_; }
+
+  private:
+    std::optional<WeldMode> weldMode_;
+    std::optional<bool> roundedLeadCorners_;
+    // Shared by buildRealWindingConductorsNamed and measureTerminalLeadLengths.
+    ConductorBuilder::Options realWindingConductorOptions(
+        const OpenMagnetics::Magnetic& magnetic, const std::vector<NamedShape>& coreShapes,
+        int wirePolygonSegments, bool femReady, MAS::CoreBobbinProcessedDescription& bobbinPd,
+        bool& toroidalCore) const;
+    // Single implementation of real-winding conductor emission, shared by buildAllNamed
+    // and buildRealWindingTurnsNamed so the assembly and the viewer cannot drift apart.
+    // coreShapes are handed to ConductorBuilder as lead-aiming obstacles (ignored for
+    // toroids); they are not part of the result.
+    std::vector<NamedShape> buildRealWindingConductorsNamed(
+        const OpenMagnetics::Magnetic& magnetic,
+        const std::vector<NamedShape>& coreShapes,
+        int wirePolygonSegments,
+        bool paintCoating,
+        bool emitCoatingShells,
+        bool femReady,
+        bool diagnosticSkipCollisionCheck = false,
+        // ABT #1265: this build is only a cutting tool for the bobbin's lead slots, so its
+        // pieces need not be welded into one body.
+        bool cutterOnly = false,
+        // ABT #1173: receives the LOWEST toroid terminal plane over the conductor builds emitted
+        // (bare and coating shells lay their leads at their own radii); NaN when none.
+        double* toroidTerminalPlaneOut = nullptr,
+        // Receives the verdict over every conductor build this call emitted: Certified only
+        // when EACH of them (bare and coating shells) was certified, otherwise the first
+        // non-certified outcome. NotRun on entry.
+        EnamelGateVerdict* enamelGateVerdictOut = nullptr) const;
 };
 
 } // namespace mvb

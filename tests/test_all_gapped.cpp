@@ -8,11 +8,14 @@
 // requested gapping spec, let MKF compute geometricalDescription/machining,
 // then build the core via MagneticBuilder and verify a positive volume.
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/catch_approx.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 #include "mvb/MagneticBuilder.h"
 #include "mvb/Utils.h"
 #include "MAS.hpp"
 #include "constructive_models/Magnetic.h"
 #include "constructive_models/Core.h"
+#include "support/Exceptions.h"
 #include <nlohmann/json.hpp>
 #include <Standard_Failure.hxx>
 #include <BRepGProp.hxx>
@@ -30,20 +33,39 @@ using json = nlohmann::json;
 #endif
 
 // Families whose gaps are STRUCTURAL, not user-specified, so a user gapping template is invalid
-// for them by definition -- not a build failure. "drumRing" joined this list when ShapeDrum
-// registered the family: before that it was unknown to the factory and skipped as unrecognised, so
-// the two DR+SRI shapes were never attempted. Now they are, and MVB++ correctly rejects them with
-// "drumRing cores cannot carry user gapping: their two annular clearance gaps are structural,
-// derived from A/K/D/F". Classify it alongside the others rather than letting a declared property
-// read as a regression.
-// "drum" joins the list for the same reason as drumRing, one layer down: MAS now
-// ships DRH-* drum records (they arrived with the MAS bump that fixed MKF main
-// compiling against its own pinned enum), but MKF has no CorePiece for the drum
-// family at all, so enrichment rejects them with "Unknown shape family: drum"
-// before any gapping is attempted. MVB++ itself builds them fine -- [all_shapes]
-// covers them with 0 failures -- so this is an MKF coverage gap, not a geometry
-// regression here.
-static const std::set<std::string> EXCLUDED = {"ui", "ut", "pqi", "t", "drum", "drumRing"};
+// for them by definition -- not a build failure.
+//
+// ABT #1191: this list no longer carries "drumRing", and it deliberately never gained
+// "drumSemiShielded". Alf's rationale: a semi-shielded drum (DRS) is a drum core with
+// ferromagnetic plastic cast around it, so it CANNOT be gapped by construction -- there are no
+// mating surfaces to grind -- and MKF's refusal (ABT #362) is correct, not a defect. The same
+// holds for drumRing (ABT #366), whose two annular clearances are derived from A/K/D/F. A skip
+// keyed on the FAMILY NAME is the wrong instrument for that: it goes stale the moment MKF changes
+// its mind, and it swallows every OTHER way a shape of that family can fail. So the refusal is
+// recognised below by the exception MKF throws -- its type and the identity of its message -- and
+// this list is reserved for families this test never even attempts.
+static const std::set<std::string> EXCLUDED = {"ui", "ut", "pqi", "t"};
+
+// ABT #1191: is this MKF's deliberate "this family cannot carry user gapping at all" refusal?
+//
+// Matched on the exception's TYPE (GapException, so an OCCT failure or any std::exception can
+// never be mistaken for one) plus the identity of the refusal message emitted by
+// Core::process_gap. The single-argument GapException constructor stamps every one of these with
+// ErrorCode::GAP_INVALID_DIMENSIONS, the same code a genuinely malformed gap gets, so the code
+// alone cannot separate them -- the message is the only identity MKF offers today. Anything else,
+// including a NotImplementedException from the very same block (drumRing with asymmetric
+// flanges), is a real failure and is reported as one.
+static bool is_construction_gap_refusal(const OpenMagnetics::GapException& e) {
+    static const std::vector<std::string> refusals = {
+        "Semi-shielded drums cannot be gapped",       // ABT #362, family drumSemiShielded
+        "drumRing cores cannot carry user gapping",   // ABT #366, family drumRing
+        "Molded cores cannot be gapped",              // ABT #357, family molded
+        "Toroids cannot be gapped",                   // family t (also in EXCLUDED)
+    };
+    for (const auto& refusal : refusals)
+        if (e.message().rfind(refusal, 0) == 0) return true;
+    return false;
+}
 
 namespace {
 
@@ -60,6 +82,7 @@ double total_volume(const std::vector<mvb::NamedShape>& pieces) {
 
 struct GappingResult {
     bool ok = false;
+    bool refusedByConstruction = false;  // ABT #1191: MKF says this family cannot be gapped
     int n_pieces = 0;
     double volume = 0.0;
     std::string error;
@@ -103,6 +126,11 @@ GappingResult build_with_gapping(const json& shape, const json& gapping,
                               " vol=" + std::to_string(r.volume);
     } catch (const Standard_Failure& e) {
         r.error = std::string("OCCT: ") + e.GetMessageString();
+    } catch (const OpenMagnetics::GapException& e) {
+        // ABT #1191: before the generic handler, so a by-construction refusal is separated from
+        // every other gap fault by MKF's own exception rather than by this test's shape list.
+        r.error = e.what();
+        r.refusedByConstruction = is_construction_gap_refusal(e);
     } catch (const std::exception& e) {
         r.error = e.what();
     } catch (...) {
@@ -133,6 +161,7 @@ void run_gap_test(const std::string& label, const json& gappingTemplate,
         // Apply the gapping template — MKF computes per-column coordinates
         // during enrichment, so we just hand it the lengths/types.
         auto result = build_with_gapping(shape, gappingTemplate, numberStacks);
+        if (!result.ok && result.refusedByConstruction) { ++skipped; continue; }  // ABT #1191
         if (!result.ok) failures.push_back(name + ": " + result.error);
         ++total;
     }
@@ -177,4 +206,156 @@ TEST_CASE("All shapes build with additive gapping",
         {{"length", 0.0001}, {"type", "additive"}},
     });
     run_gap_test("additive_gapping", gapping, 1);
+}
+
+// EVERY SUBTRACTIVE GAP MUST CUT. Found 2026-09-05 on the OMFEM 3D pipeline with 00_debug
+// (PQ 20/16, one turn, three 5 um residual gaps retyped to subtractive so the FEM sees them):
+// ShapeP::applyMachining -- which PQ, RM and PM inherit -- returned the piece untouched for any
+// side-column machining ("no outer column to cut"), and MagneticBuilder accepted a cut that
+// removed nothing. The core reached the mesher gapped on the centre post only and the 3D
+// inductance read +82% against MKF; the fault was chased through the mesher and the solver
+// before the geometry was checked. This test builds the same core and asks the only question
+// that matters: did each machining remove material?
+//   - centre gap alone must remove ~ (column area) x gap
+//   - all three must remove strictly more than the centre alone
+// and MagneticBuilder now throws on a cut that removes nothing, so a regression fails loudly
+// either way.
+TEST_CASE("PQ 20/16: a subtractive gap on each leg is machined, not just the centre post",
+          "[shapes][gapping][sidegap][abt-omfem-00debug]") {
+    std::ifstream f(std::string(MAS_DATA_DIR) + "/core_shapes.ndjson");
+    REQUIRE(f.is_open());
+    json pq;
+    std::string line;
+    while (std::getline(f, line)) {
+        if (line.empty()) continue;
+        json shape = json::parse(line, nullptr, false);
+        if (!shape.is_discarded() && shape.value("name", "") == "PQ 20/16") { pq = shape; break; }
+    }
+    REQUIRE(!pq.is_null());
+    mvb::patch_dimension_nominals(pq);
+
+    const double gap = 5e-6;
+    // The gap layout MKF itself emits for an all-legs ground core: one per column, with
+    // coordinates (00_debug's gapping, retyped).
+    json all = json::array({
+        {{"length", gap}, {"type", "subtractive"}, {"coordinates", {0.0, 0.0, 0.0}}, {"shape", "round"},
+         {"area", 6.0821e-05}, {"sectionDimensions", {0.0088, 0.0088}},
+         {"distanceClosestNormalSurface", 0.0051475}, {"distanceClosestParallelSurface", 0.0046}},
+        {{"length", gap}, {"type", "subtractive"}, {"coordinates", {0.010122107, 0.0, 0.0}}, {"shape", "irregular"},
+         {"area", 3.1419e-05}, {"sectionDimensions", {0.002244214, 0.014}},
+         {"distanceClosestNormalSurface", 0.0051475}, {"distanceClosestParallelSurface", 0.0046}},
+        {{"length", gap}, {"type", "subtractive"}, {"coordinates", {-0.010122107, 0.0, 0.0}}, {"shape", "irregular"},
+         {"area", 3.1419e-05}, {"sectionDimensions", {0.002244214, 0.014}},
+         {"distanceClosestNormalSurface", 0.0051475}, {"distanceClosestParallelSurface", 0.0046}},
+    });
+    json centreOnly = json::array({all[0]});
+    json none = json::array();
+
+    auto vNone = build_with_gapping(pq, none);
+    auto vCentre = build_with_gapping(pq, centreOnly);
+    auto vAll = build_with_gapping(pq, all);
+    INFO("ungapped: " << vNone.error << " centre: " << vCentre.error << " all: " << vAll.error);
+    REQUIRE(vNone.ok); REQUIRE(vCentre.ok); REQUIRE(vAll.ok);
+
+    const double removedCentre = vNone.volume - vCentre.volume;   // both halves
+    const double removedAll = vNone.volume - vAll.volume;
+    INFO("removed by the centre gap: " << removedCentre * 1e9 << " mm3, by all three: " << removedAll * 1e9 << " mm3");
+    // centre column: F = 8.8 mm round -> 60.8 mm2 x 5 um (2.5 um per half, two halves) ~ 0.30 mm3;
+    // the 12-segment polygon column is a little smaller than the circle.
+    CHECK(removedCentre > 0.25e-9);
+    CHECK(removedCentre < 0.35e-9);
+    // the two legs add ~ 2 x 31.4 mm2 x 5 um ~ 0.31 mm3 -- at least half of that must be there
+    CHECK(removedAll - removedCentre > 0.15e-9);
+}
+
+// ---------------------------------------------------------------------------------------------
+// ABT #1184. "This cut removed nothing" answers two different questions, and only one of them is
+// a defect. Both are pinned here, so neither half of the distinction can be lost again.
+namespace {
+
+// A core of the named shape with one subtractive gap, taken through MKF so the machining that
+// comes back is the real thing rather than something hand-written.
+OpenMagnetics::Core one_gap_core(const std::string& shapeName, double gapLength) {
+    std::ifstream f(std::string(MAS_DATA_DIR) + "/core_shapes.ndjson");
+    REQUIRE(f.is_open());
+    std::string line;
+    json shape;
+    while (std::getline(f, line)) {
+        if (line.empty()) continue;
+        json candidate = json::parse(line, nullptr, false);
+        if (candidate.is_discarded()) continue;
+        if (candidate.value("name", "") == shapeName) { shape = candidate; break; }
+    }
+    REQUIRE(!shape.is_null());
+    mvb::patch_dimension_nominals(shape);
+    json coreJson;
+    coreJson["functionalDescription"] = {
+        {"name", "dummy"}, {"type", "two-piece set"}, {"material", "N97"}, {"shape", shape},
+        {"gapping", json::array({ json{{"length", gapLength}, {"type", "subtractive"}} })},
+        {"numberStacks", 1},
+    };
+    return OpenMagnetics::Core(coreJson);
+}
+
+} // namespace
+
+TEST_CASE("A gap tool that misses the column is an error", "[shapes][gapping][machining]") {
+    auto core = one_gap_core("E 42/21/20", 0.001);
+    auto geometry = core.get_geometrical_description().value();
+
+    mvb::MagneticBuilder builder;
+    REQUIRE(builder.buildCoreNamed(core).size() == 2);   // as MKF places it, the gap is cut
+
+    // The same gap with its tool moved 50 mm along the column axis, far outside the piece.
+    // Nothing is removed because nothing is there, and that silently-ungapped core is what this
+    // guard exists to catch: a FEM run on it reports the gapless inductance with no sign
+    // anything is wrong.
+    int toolsMoved = 0;
+    for (auto& piece : geometry) {
+        if (!piece.get_machining()) continue;
+        auto machining = *piece.get_machining();
+        for (auto& operation : machining) {
+            auto coordinates = operation.get_coordinates();
+            coordinates[1] = (coordinates[1] >= 0 ? 0.05 : -0.05);
+            operation.set_coordinates(coordinates);
+            ++toolsMoved;
+        }
+        piece.set_machining(machining);
+    }
+    REQUIRE(toolsMoved > 0);
+
+    auto missed = core;
+    missed.set_geometrical_description(geometry);
+    REQUIRE_THROWS_WITH(builder.buildCoreNamed(missed),
+                        Catch::Matchers::ContainsSubstring("core machining removed nothing"));
+}
+
+TEST_CASE("A gap already cut by an overlapping neighbour is not a missing gap",
+          "[shapes][gapping][machining]") {
+    auto core = one_gap_core("E 42/21/20", 0.001);
+    mvb::MagneticBuilder builder;
+    const double singleCutVolume = total_volume(builder.buildCoreNamed(core));
+    REQUIRE(singleCutVolume > 0.0);
+
+    // Two cuts in the same place. The second finds the material gone -- yet the gap it asks for
+    // is there, ground by the first. MKF produces exactly this whenever a distributed gapping's
+    // gaps are longer than the columnHeight / (numberGaps + 1) spacing it lays them out on,
+    // which is why 102 catalogue shapes used to fail the distributed case above.
+    auto geometry = core.get_geometrical_description().value();
+    int piecesDuplicated = 0;
+    for (auto& piece : geometry) {
+        if (!piece.get_machining()) continue;
+        auto machining = *piece.get_machining();
+        machining.push_back(machining.front());
+        piece.set_machining(machining);
+        ++piecesDuplicated;
+    }
+    REQUIRE(piecesDuplicated > 0);
+
+    auto overlapping = core;
+    overlapping.set_geometrical_description(geometry);
+    auto pieces = builder.buildCoreNamed(overlapping);
+    REQUIRE(pieces.size() == 2);
+    // cutting the same slab twice leaves exactly the geometry cutting it once does
+    CHECK(total_volume(pieces) == Catch::Approx(singleCutVolume));
 }

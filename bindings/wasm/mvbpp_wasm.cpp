@@ -2,6 +2,8 @@
 #include <emscripten/val.h>
 #include <emscripten/emscripten.h>
 
+#include "mvb/shapes/ShapeBuilder.h"
+#include "mvb/shapes/ShapeDrumSemishielded.h"
 #include "mvb/MagneticBuilder.h"
 #include "mvb/Symmetry.h"
 #include "mvb/StepExporter.h"
@@ -13,6 +15,7 @@
 #include "mvb/BobbinBuilder.h"
 #include "mvb/TurnBuilder.h"
 #include "mvb/Utils.h"
+#include "mvb/mesh/Mesher.h"
 #include "constructive_models/Magnetic.h"
 #include "constructive_models/Coil.h"
 #include <nlohmann/json.hpp>
@@ -29,6 +32,7 @@
 #include <random>
 #include <stdexcept>
 #include <string>
+#include <optional>
 #include <vector>
 
 using namespace emscripten;
@@ -79,17 +83,17 @@ void drop_null_shapes(std::vector<mvb::NamedShape>& named) {
                 named.end());
 }
 
-// paintCoating arrives from JS as an optional trailing argument. To keep the
-// long-standing default (turns drawn at the OUTER/insulation diameter), an
-// omitted/undefined value MUST resolve to true — existing callers pass no such
-// argument and must keep getting the insulation footprint. Pass false to draw
-// the CONDUCTING (copper) cross-section for FEM winding-loss meshing.
+// paintCoating arrives from JS as an optional trailing argument. THE BROWSER IS THE ONE
+// PLACE THAT DRAWS THE COATED FOOTPRINT (Alf, 2026-09-17: "use CD for Ansys, and always use
+// CD as default. We will use OD in the web browser."), so an omitted/undefined value resolves
+// to true here and ONLY here — every C++/Python entry point now defaults to the CONDUCTING
+// cross-section (ABT #1261). Pass false from JS to get the copper for FEM meshing.
 bool resolvePaintCoating(const val& v) {
     if (v.isUndefined() || v.isNull()) return true;
     return v.as<bool>();
 }
 
-// useRealWindingGeometry is an optional trailing argument (drawMagnetic only); omitted/undefined
+// useRealWindingGeometry is an optional trailing argument (drawMagnetic and drawTurns); omitted/undefined
 // keeps the legacy per-turn-loop geometry. Pass true for ONE continuous copper body per (winding,
 // parallel) via MKF real winding.
 bool resolveUseRealWinding(const val& v) {
@@ -97,7 +101,7 @@ bool resolveUseRealWinding(const val& v) {
     return v.as<bool>();
 }
 
-// femReady is an optional trailing argument (drawMagnetic only, with useRealWindingGeometry=true);
+// femReady is an optional trailing argument (drawMagnetic/drawTurns, with useRealWindingGeometry=true);
 // omitted/undefined keeps the FAST per-run compound (drawing). Pass true for the SLOW meshable
 // geometry: one-piece per parallel where a sweep closes, conformal mitre for dense toroids.
 bool resolveFemReady(const val& v) {
@@ -235,6 +239,10 @@ std::string deliver(std::vector<mvb::NamedShape> named,
                     double scale,
                     const std::string& symmetry,
                     const std::string& side) {
+    // Checked before the pipeline, so an empty build is not reported as the side filter's doing.
+    if (named.empty()) {
+        throw std::runtime_error("mvbpp: the builder produced no geometry to deliver");
+    }
     std::string m = upper(mode);
     if (m != "2D" && m != "3D") {
         throw std::runtime_error("mvbpp: mode must be '3D' or '2D' (got '" + mode + "')");
@@ -306,6 +314,32 @@ std::vector<mvb::NamedShape> build_core(const std::string& json_str, int polygon
         j = std::move(wrap);
     }
 
+    // Drawing a CORE needs no coil. Going through parseEnriched sends a core-only request
+    // into magnetic_autocomplete, which throws "Cannot compute proportion for zero windings"
+    // on the dummy coil above and falls back to a path that emits a TWO-HALF-SET layout
+    // regardless of the core's stated type — so a closedShape moulded body came out as two
+    // mirrored halves, 22.8 mm against its stated 11.4, with its effective magnetic path
+    // doubled to match.
+    //
+    // OpenMagnetics::Core computes the geometricalDescription from the core alone and honours
+    // the type, so build it directly and only fall back for a genuine Magnetic that needs the
+    // coil-aware pipeline.
+    const nlohmann::json& coreJson = j.at("core");
+    if (!coreJson.contains("geometricalDescription") ||
+        coreJson.at("geometricalDescription").is_null()) {
+        try {
+            OpenMagnetics::Core coreOnly(coreJson);
+            if (coreOnly.get_geometrical_description().has_value() &&
+                !coreOnly.get_geometrical_description()->empty()) {
+                mvb::MagneticBuilder coreBuilder;
+                return coreBuilder.buildCoreNamed(coreOnly, polygonSegments);
+            }
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "[mvbpp] build_core: core-only path failed (%s); "
+                                 "falling back to the full pipeline\n", e.what());
+        }
+    }
+
     auto enriched = parseEnriched(j.dump());
     const auto& core = enriched.get_core();
     mvb::MagneticBuilder b;
@@ -319,13 +353,14 @@ std::vector<mvb::NamedShape> build_spacer(const std::string& json_str, int /*pol
     if (!gdOpt || gdOpt->empty()) {
         throw std::runtime_error("drawSpacer: core has no geometricalDescription");
     }
-    auto shapes = mvb::SpacerBuilder::buildSpacers(*gdOpt);
+    // ABT #1170: a spacer is a shape PLUS the insulation material MAS declares for it, and the
+    // whole assembly names them through mvb::appendSpacerSolids. This binding builds the spacers
+    // alone, so it takes the same shapes and the same "Spacer_<i>" names and role.
     std::vector<mvb::NamedShape> out;
-    out.reserve(shapes.size());
-    int i = 0;
-    for (auto& s : shapes) {
-        if (s.IsNull()) continue;
-        out.push_back(mvb::NamedShape{ std::move(s), "Spacer_" + std::to_string(i++) });
+    for (auto& spacer : mvb::SpacerBuilder::buildSpacers(*gdOpt)) {
+        if (spacer.shape.IsNull()) continue;
+        out.push_back(mvb::NamedShape{std::move(spacer.shape), "Spacer_" + std::to_string(out.size()),
+                                      mvb::Role::Spacer});
     }
     return out;
 }
@@ -374,6 +409,55 @@ std::vector<mvb::NamedShape> build_core_piece(const std::string& json_str, int p
     return {b.buildCorePieceNamed(shape, polygonSegments)};
 }
 
+// The magnetic-epoxy shell of a semi-shielded drum, as its own product.
+//
+// It is NOT part of drawCore: MAS models the shell as a coating, not a core piece, and a
+// semi-shielded part exists to have a winding inside a low-permeability return path. Fusing
+// the shell into the core would hide that winding permanently, so the two are delivered
+// separately and the viewer renders the shell translucent over an opaque drum — the same
+// arrangement already used for the FR4 board of a planar part.
+//
+// Returns an empty product list for every other family, so a caller can ask unconditionally.
+std::vector<mvb::NamedShape> build_core_shell(const std::string& json_str, int polygonSegments) {
+    auto j = json::parse(json_str);
+    const auto& coreJson = j.contains("core") ? j["core"] : j;
+    if (!coreJson.contains("functionalDescription")) return {};
+    const auto& fd = coreJson["functionalDescription"];
+    if (!fd.contains("shape") || !fd["shape"].is_object()) return {};
+    const auto& shapeJson = fd["shape"];
+
+    auto shape = shapeJson.get<MAS::CoreShape>();
+    if (shape.get_family() != MAS::CoreShapeFamily::DRUM_SEMISHIELDED) {
+        // Not a semishielded drum, so there is no magnetic-epoxy cap -- but the core may
+        // declare an insulating COATING, which is the same kind of product: a layer over the
+        // core, drawn translucently on top of it. It has to come from HERE rather than from
+        // drawCore, because the 3D viewers do not call drawMagnetic at all -- they compose the
+        // assembly product by product (drawCore + drawCoreShell + drawBobbin + drawTurns), and
+        // a coating fused into the core solid could not be shaded as the separate layer it is.
+        const double thickness = mvb::MagneticBuilder::declaredCoreCoatingThickness(
+            coreJson.get<MAS::MagneticCore>());
+        if (thickness <= 0.0) return {};
+        std::vector<mvb::NamedShape> coatings;
+        for (const auto& piece : build_core(json_str, polygonSegments)) {
+            auto shell = mvb::MagneticBuilder::buildCoreCoatingShell(piece.shape, thickness);
+            if (!shell.IsNull()) coatings.push_back({shell, piece.name + " coating"});
+        }
+        return coatings;
+    }
+    auto dimsOpt = shape.get_dimensions();
+    if (!dimsOpt) return {};
+    auto dims = mvb::flatten_dimensions(*dimsOpt);
+
+    // Carve the shell against the SAME drum solid drawCore delivers, so the two products
+    // meet exactly instead of interpenetrating by a faceting error.
+    auto builder = mvb::shapes::createShapeBuilder(MAS::CoreShapeFamily::DRUM_SEMISHIELDED,
+                                                   /*subtype=*/"", polygonSegments);
+    TopoDS_Shape drum = builder ? builder->buildPiece(shape) : TopoDS_Shape();
+    TopoDS_Shape shell = mvb::shapes::buildSemishieldedShell(dims, drum, polygonSegments);
+    if (shell.IsNull()) return {};
+    return {mvb::NamedShape(shell, "Shield shell")};
+}
+
 std::vector<mvb::NamedShape> build_bobbin(const std::string& json_str, int polygonSegments) {
     auto j = json::parse(json_str);
     auto bobbin = j.get<MAS::Bobbin>();
@@ -381,10 +465,65 @@ std::vector<mvb::NamedShape> build_bobbin(const std::string& json_str, int polyg
     return {b.buildBobbinNamedFromBobbin(bobbin, /*axisIsY=*/true, polygonSegments)};
 }
 
+// MEASURED, 2026-09-23 (Alf's custom_magnetic 41, 6 turns, node): the geometry proofs cost NOTHING
+// measurable -- 11.4 s with them on against 12.0 s with them off, i.e. inside the noise, while the
+// conductor build alone is ~10 s of it (MKF's re-wind 0.03-0.3 s, the core 0.3-0.7 s, the STL
+// ~0.7 s). So the browser runs the SAME proofs as every other consumer: an unproven picture that
+// is no faster is worth nothing. The switch stays because it is what priced them, and
+// mvbppSetSkipChecks(true) prices them again on any design; timing comes from mvbppLastTimingMs().
+bool g_skipGeometryChecks = false;
+// mvbppSetWeldMode("off" | "auto" | "all"): how every real-winding conductor drawn from now on
+// is welded (mvb::WeldMode). A module-level switch like mvbppSetSkipChecks, not another trailing
+// argument: embind enforces exact arity, so a new argument would break every existing caller of
+// drawMagnetic/drawTurns. Unset = the library default ("auto"; the browser has no MVB_WELD_ALL).
+std::optional<mvb::WeldMode> g_weldMode;
+// Terminal-lead corner style for real winding (ConductorBuilder::Options::roundedLeadCorners); unset = round.
+std::optional<bool> g_roundedLeadCorners;
+bool g_reportTiming = false;
+double g_lastEnrichMs = 0.0, g_lastBuildMs = 0.0, g_lastCoreMs = 0.0;
+
+double now_ms() {
+    return emscripten_get_now();
+}
+
 std::vector<mvb::NamedShape> build_turns(const std::string& json_str, int polygonSegments,
-                                         bool paintCoating) {
+                                         bool paintCoating, bool useRealWindingGeometry = false,
+                                         bool femReady = false) {
     auto j = json::parse(json_str);
     mvb::MagneticBuilder b;
+    if (g_weldMode) b.setWeldMode(*g_weldMode);
+    if (g_roundedLeadCorners) b.setRoundedLeadCorners(*g_roundedLeadCorners);
+    if (useRealWindingGeometry) {
+        // Real winding needs MKF to (re-)wind, which needs the whole magnetic — a bare
+        // turnsDescription array carries no wire, bobbin or core to route against. Say so
+        // instead of silently falling back to the per-turn loops the caller asked NOT to get.
+        if (!j.is_object() || !(j.contains("coil") && j.contains("core"))) {
+            throw std::runtime_error(
+                "drawTurns: useRealWindingGeometry=true needs a full Magnetic JSON with "
+                "'coil' and 'core' (MKF must re-wind to route the real conductor); a bare "
+                "turnsDescription array cannot be used.");
+        }
+        const double t0 = now_ms();
+        auto magnetic = mvb::magnetic_autocomplete_safe(j, /*useRealWindingGeometry=*/true);
+        const double t1 = now_ms();
+        g_lastEnrichMs = t1 - t0;
+        // The conductor cross-section stays an exact circle regardless of segments, so the
+        // wire segment count is moot (0); polygonSegments still facets the core built
+        // internally for lead aiming.
+        if (g_reportTiming) {   // the core is built inside the call below (for lead aiming); price it
+            const double c0 = now_ms();
+            b.buildCoreNamed(magnetic.get_core(), polygonSegments);
+            g_lastCoreMs = now_ms() - c0;
+        }
+        auto out = b.buildRealWindingTurnsNamed(magnetic, /*wirePolygonSegments=*/0,
+                                                polygonSegments, paintCoating, femReady,
+                                                g_skipGeometryChecks);
+        g_lastBuildMs = now_ms() - t1;
+        if (g_reportTiming)
+            std::fprintf(stderr, "[mvbpp] real winding: MKF re-wind %.0f ms, geometry %.0f ms (core %.0f ms)\n",
+                         g_lastEnrichMs, g_lastBuildMs, g_lastCoreMs);
+        return out;
+    }
     if (j.is_array()) {
         // Standalone path: each Turn must carry its own dimensions and
         // cross_sectional_shape. Throws for toroidal turns (which need
@@ -461,19 +600,31 @@ std::vector<mvb::NamedShape> build_magnetic(const std::string& json_str, int pol
             "drawMagnetic: the JSON has no 'core'/'coil'. Pass a magnetic object "
             "({core, coil, ...}) or a full MAS file that contains one under 'magnetic'.");
     mvb::MagneticBuilder b;
+    if (g_weldMode) b.setWeldMode(*g_weldMode);
+    if (g_roundedLeadCorners) b.setRoundedLeadCorners(*g_roundedLeadCorners);
     // useRealWindingGeometry: replace the per-turn closed loops with ONE continuous copper body per
     // (winding, parallel). MKF must (re)wind, so re-enrich through the real-winding autocomplete.
-    // The conductor cross-section stays an exact circle regardless of segments, so wireSeg is moot
-    // (0); polygonSegments still facets the core/bobbin.
+    // Drawing (femReady false): the conductor cross-section stays an exact circle; polygonSegments
+    // facets the core/bobbin only. FEM (femReady true): wire and core facet in LOCKSTEP at
+    // polygonSegments, the tools/mvbpp_step_generator --fem --segments N contract ("core faceting
+    // follows wire faceting, always"): a faceted wire against an exact core wall touches it at every
+    // polygon vertex, which gmsh's fragment then corrupts.
     // femReady: false [default] -> fast per-run compound (drawing); true -> slow one-piece/conformal
     // FEM geometry (single body where a sweep closes, conformal mitre for dense toroids).
     if (useRealWindingGeometry) {
         auto magnetic = mvb::magnetic_autocomplete_safe(j, /*useRealWindingGeometry=*/true);
         return b.buildAllNamed(magnetic, /*includeBobbin=*/true, /*symmetryPlanes=*/0,
-                               /*wireSeg=*/0, polygonSegments, paintCoating,
+                               /*wireSeg=*/femReady ? polygonSegments : 0, polygonSegments, paintCoating,
                                /*emitCoatingShells=*/false, /*includeInsulation=*/false,
-                               /*coreCoatingThickness=*/0.0, /*useRealWindingGeometry=*/true,
-                               femReady);
+                               // The declared core coating, drawn as its own solid. This binding
+                               // reaches buildAllNamed directly, so it has to make the same call
+                               // MagneticBuilder::drawMagnetic makes -- otherwise a coated core
+                               // draws bare in every consumer that goes through the bindings,
+                               // which is every 3D viewer.
+                               mvb::MagneticBuilder::declaredCoreCoatingThickness(magnetic.get_core()),
+                               /*useRealWindingGeometry=*/true,
+                               femReady,
+                               g_skipGeometryChecks);   // a picture, not a part -- see drawTurns
     }
     auto magnetic = j.get<MAS::Magnetic>();
     std::size_t numTurns = 0;
@@ -481,7 +632,12 @@ std::vector<mvb::NamedShape> build_magnetic(const std::string& json_str, int pol
     if (turnsOpt.has_value()) numTurns = turnsOpt->size();
     const int wireSeg = adaptive_wire_segments(polygonSegments, numTurns);
     return b.buildAllNamed(magnetic, /*includeBobbin=*/true, /*symmetryPlanes=*/0,
-                            wireSeg, polygonSegments, paintCoating);
+                            wireSeg, polygonSegments, paintCoating,
+                            /*emitCoatingShells=*/false, /*includeInsulation=*/false,
+                            // Same call as the real-winding branch above: a declared core
+                            // coating is drawn on both paths, or the drawing depends on which
+                            // winding mode the caller happened to ask for.
+                            mvb::MagneticBuilder::declaredCoreCoatingThickness(magnetic.get_core().value()));
 }
 
 std::string draw_view_impl(const std::string& json_str,
@@ -567,6 +723,22 @@ std::string _drawCoreToPath(const std::string& json_str,
 }
 
 // drawCorePiece
+val _drawCoreShell(const std::string& json_str,
+                   const std::string& mode,
+                   const std::string& plane,
+                   double offset,
+                   const std::string& format,
+                   double scale,
+                   int polygonSegments,
+                   const std::string& symmetry,
+                   const std::string& side) {
+    auto named = build_core_shell(json_str, polygonSegments);
+    if (named.empty()) return val::null();
+    auto data = deliver(std::move(named), mode, plane, offset,
+                        format, scale, symmetry, side);
+    return makeUint8Array(data);
+}
+
 val _drawCorePiece(const std::string& json_str,
                    const std::string& mode,
                    const std::string& plane,
@@ -643,6 +815,24 @@ std::string _drawBobbinToPath(const std::string& json_str,
 }
 
 // drawTurns
+// Measurement/inspection handles for the viewer (see g_skipGeometryChecks above).
+void _setSkipChecks(bool on) { g_skipGeometryChecks = on; }
+void _setWeldMode(const std::string& mode) { g_weldMode = mvb::parseWeldMode(mode); }   // throws on a bad name
+std::string _getWeldMode() { return mvb::weldModeName(g_weldMode.value_or(mvb::WeldMode::Auto)); }
+void _setLeadCorners(const std::string& style) {
+    if (style == "round") g_roundedLeadCorners = true;
+    else if (style == "sharp") g_roundedLeadCorners = false;
+    else throw std::runtime_error("mvbppSetLeadCorners: takes 'round' or 'sharp', got '" + style + "'");
+}
+std::string _getLeadCorners() { return g_roundedLeadCorners.value_or(true) ? "round" : "sharp"; }
+void _setReportTiming(bool on) { g_reportTiming = on; }
+std::string _lastTimingMs() {
+    char buf[128];
+    std::snprintf(buf, sizeof(buf), "{\"enrichMs\":%.1f,\"buildMs\":%.1f,\"coreMs\":%.1f}",
+                  g_lastEnrichMs, g_lastBuildMs, g_lastCoreMs);
+    return std::string(buf);
+}
+
 val _drawTurns(const std::string& json_str,
                const std::string& mode,
                const std::string& plane,
@@ -652,8 +842,12 @@ val _drawTurns(const std::string& json_str,
                int polygonSegments,
                const std::string& symmetry,
                const std::string& side,
-               val paintCoating) {
-    auto named = build_turns(json_str, polygonSegments, resolvePaintCoating(paintCoating));
+               val paintCoating,
+               val useRealWindingGeometry,
+               val femReady) {
+    auto named = build_turns(json_str, polygonSegments, resolvePaintCoating(paintCoating),
+                             resolveUseRealWinding(useRealWindingGeometry),
+                             resolveFemReady(femReady));
     auto data = deliver(std::move(named), mode, plane, offset,
                         format, scale, symmetry, side);
     return makeUint8Array(data);
@@ -669,8 +863,12 @@ std::string _drawTurnsToPath(const std::string& json_str,
                              int polygonSegments,
                              const std::string& symmetry,
                              const std::string& side,
-                             val paintCoating) {
-    auto named = build_turns(json_str, polygonSegments, resolvePaintCoating(paintCoating));
+                             val paintCoating,
+                             val useRealWindingGeometry,
+                             val femReady) {
+    auto named = build_turns(json_str, polygonSegments, resolvePaintCoating(paintCoating),
+                             resolveUseRealWinding(useRealWindingGeometry),
+                             resolveFemReady(femReady));
     auto data = deliver(std::move(named), mode, plane, offset,
                         format, scale, symmetry, side);
     write_bytes(path, data);
@@ -873,6 +1071,24 @@ std::string _enrichMagnetic(const std::string& json_str) {
     return out.dump();
 }
 
+// What the mesher in this module was built from (ABT #1588/#1592). It initialises the linked
+// gmsh to ask its version, so it is also the proof that gmsh and MMG are in the module and run.
+std::string _meshBuildRevision() { return mvb::mesh::buildRevision().dump(); }
+
+// MAS magnetic + mesh recipe -> mesh in one export format (ABT #1588), as JSON:
+// {"mesh": <file text>, "recipe": <effective recipe>, "sidecars": {suffix: text}}.
+// The same mvb::mesh::meshMagnetic as native: the browser meshes with the same gmsh and MMG.
+// optionsJson: exportMesh's options ("{}" for none; {"partsOnly": true} for the parts without air).
+std::string _meshMagnetic(const std::string& magneticJson, const std::string& recipeJson,
+                          const std::string& format, const std::string& unit,
+                          const std::string& optionsJson) {
+    const auto r = mvb::mesh::meshMagnetic(nlohmann::json::parse(magneticJson), nlohmann::json::parse(recipeJson));
+    nlohmann::json out = {{"mesh", mvb::mesh::exportMesh(r.mesh, format, unit, nlohmann::json::parse(optionsJson))},
+                          {"recipe", r.recipe},
+                          {"sidecars", r.sidecars}};
+    return out.dump();
+}
+
 // Re-exposed for the WebFrontend worker (both still exist in C++, just unbound after the
 // draw* API refactor): the symmetry-plane query the 3D viewer uses to offer half/quarter
 // cut options, and the core-gapping technical drawing (SVG) the technical-drawing exporter
@@ -907,10 +1123,18 @@ EMSCRIPTEN_BINDINGS(mvbpp) {
     // 7-function unified API
     function("drawCore",            &guard<&_drawCore>::call);
     function("drawCoreToPath",      &guard<&_drawCoreToPath>::call);
+    function("drawCoreShell",       &guard<&_drawCoreShell>::call);
     function("drawCorePiece",       &guard<&_drawCorePiece>::call);
     function("drawCorePieceToPath", &guard<&_drawCorePieceToPath>::call);
     function("drawBobbin",          &guard<&_drawBobbin>::call);
     function("drawBobbinToPath",    &guard<&_drawBobbinToPath>::call);
+    function("mvbppSetSkipChecks",  &_setSkipChecks);
+    function("mvbppSetWeldMode",    &guard<&_setWeldMode>::call);
+    function("mvbppSetLeadCorners", &guard<&_setLeadCorners>::call);
+    function("mvbppGetLeadCorners", &_getLeadCorners);
+    function("mvbppGetWeldMode",    &_getWeldMode);
+    function("mvbppSetReportTiming", &_setReportTiming);
+    function("mvbppLastTimingMs",   &_lastTimingMs);
     function("drawTurns",           &guard<&_drawTurns>::call);
     function("drawTurnsToPath",     &guard<&_drawTurnsToPath>::call);
     function("drawWinding",         &guard<&_drawWinding>::call);
@@ -930,6 +1154,8 @@ EMSCRIPTEN_BINDINGS(mvbpp) {
 
     // Metadata
     function("getSupportedFamilies", &guard<&mvb::get_supported_families>::call);
+    function("meshBuildRevision",   &guard<&_meshBuildRevision>::call);
+    function("meshMagnetic",        &guard<&_meshMagnetic>::call);
 
     // Re-exposed for the WebFrontend worker (unbound after the draw* refactor)
     function("getSymmetryPlanes",   &guard<&_getSymmetryPlanes>::call);

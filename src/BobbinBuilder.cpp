@@ -1,6 +1,6 @@
 #include "mvb/BobbinBuilder.h"
-#include "mvb/Utils.h"
 #include "constructive_models/Bobbin.h"
+#include "mvb/Utils.h"
 #include <TopExp_Explorer.hxx>
 #include <TopAbs_ShapeEnum.hxx>
 #include <TopTools_ListOfShape.hxx>
@@ -94,7 +94,25 @@ static void checkIsDone(const BRepAlgoAPI_Fuse& op, const char* ctx) {
     if (!op.IsDone()) throw std::runtime_error(std::string("BobbinBuilder: Fuse failed: ") + ctx);
 }
 
-TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescription& bobbin, double flangeThickness, bool axisIsY, int polygonSegments) {
+std::vector<NamedShape> BobbinBuilder::buildPinRailsNamed(const std::vector<OpenMagnetics::Bobbin::PinRailBlock>& pinRails,
+                                                          const std::string& bobbinName) {
+    std::vector<NamedShape> out;
+    for (const auto& rail : pinRails) {
+        if (rail.centre.size() != 3 || rail.halfExtents.size() != 3 ||
+            !(rail.halfExtents[0] > 0.0) || !(rail.halfExtents[1] > 0.0) || !(rail.halfExtents[2] > 0.0))
+            throw std::invalid_argument("BobbinBuilder: pin rail '" + rail.name + "' of bobbin '" + bobbinName +
+                                        "' is not a box with three positive half extents");
+        gp_Pnt corner(rail.centre[0] - rail.halfExtents[0], rail.centre[1] - rail.halfExtents[1],
+                      rail.centre[2] - rail.halfExtents[2]);
+        out.emplace_back(BRepPrimAPI_MakeBox(corner, 2.0 * rail.halfExtents[0], 2.0 * rail.halfExtents[1],
+                                             2.0 * rail.halfExtents[2]).Shape(),
+                         bobbinName + " " + rail.name, Role::Bobbin);
+    }
+    return out;
+}
+
+TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescription& bobbin, double flangeThickness, bool axisIsY, int polygonSegments,
+                                        const std::vector<OpenMagnetics::Bobbin::PinRailBlock>& pinRails) {
     if (flangeThickness < 0.0 || std::isnan(flangeThickness)) {
         throw std::invalid_argument("BobbinBuilder: flangeThickness is invalid");
     }
@@ -166,8 +184,9 @@ TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescriptio
         if (innerR <= 0.0) innerR = outerR - wallThickness;
 
         // Build the cylinder along +Z, then translate it to its axial position.
-        auto make_cyl = [&](double radius, double h, double zBottom) -> TopoDS_Shape {
-            TopoDS_Shape c = build_polygon_cylinder(h, radius, polygonSegments);
+        auto make_cyl = [&](double radius, double h, double zBottom,
+                            bool circumscribed = false) -> TopoDS_Shape {
+            TopoDS_Shape c = build_polygon_cylinder(h, radius, polygonSegments, circumscribed);
             return translate_shape(c, 0.0, 0.0, zBottom);
         };
 
@@ -176,7 +195,9 @@ TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescriptio
             TopoDS_Shape outerCyl = make_cyl(outerR, h, span.bottom);
             if (innerR + 1e-9 >= outerR) return outerCyl;
             double innerHeight = h * 1.1;
-            TopoDS_Shape innerCyl = make_cyl(innerR, innerHeight, span.bottom - (innerHeight - h) / 2.0);
+            // The bore faces the core column: circumscribe so faceting never bites in.
+            TopoDS_Shape innerCyl = make_cyl(innerR, innerHeight, span.bottom - (innerHeight - h) / 2.0,
+                                             /*circumscribed=*/true);
             BRepAlgoAPI_Cut cutOp(outerCyl, innerCyl);
             checkIsDone(cutOp, "round body hollow");
             return cutOp.Shape();
@@ -188,7 +209,10 @@ TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescriptio
                 double holeHeight = thickness * 1.2;
                 double holeMargin = (holeHeight - thickness) / 2.0;
                 TopoDS_Shape disc = make_cyl(flangeOuterR, thickness, zBottom);
-                TopoDS_Shape hole = make_cyl(innerR, holeHeight, zBottom - holeMargin);
+                // Flange holes face the core column: circumscribe so faceting never bites in
+                // (measured on EP 13: inscribed chords cut 0.42 mm^3 into the EXACT column).
+                TopoDS_Shape hole = make_cyl(innerR, holeHeight, zBottom - holeMargin,
+                                             /*circumscribed=*/true);
                 BRepAlgoAPI_Cut cut(disc, hole);
                 checkIsDone(cut, ctx);
                 return cut.Shape();
@@ -220,25 +244,42 @@ TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescriptio
         if (holeDepth <= 0.0) holeDepth = outerDepth * 0.8;
         double eps = wallThickness > 0 ? wallThickness * 0.1 : 1e-6;
 
+        // Rounded corners: real U/E bobbins are moulded with a corner radius on the
+        // OUTER winding surface rather than a sharp 90°. The inner bore (and the
+        // flange holes) stay SQUARE so they still match the square core central
+        // column — rounding the bore would push bobbin material into the column
+        // corners and overlap it.
+        //
+        // THE CORNER IS MKF'S, and it is the one the copper wraps (ABT #959, #1295). MKF charges
+        // every rect-column turn for a corner of radius frame.cornerRadius + standoff, where
+        // frame.cornerRadius is Bobbin::get_column_corner_radius (the MAS datum; MKF's quick
+        // bobbin states it), and ConductorBuilder draws exactly that wrap. The plastic under the
+        // copper is drawn on the same radius, concentric with every turn: a sharper former pokes
+        // its corner into the innermost turn (02_flyback_efd25_3c95: the square IRREGULAR former's
+        // corner 0.47 mm into the copper of a 1.388 mm wrap), a blunter one (the old 1/4 of the
+        // smaller side) leaves the copper floating. IRREGULAR columns are included: their wrap
+        // path uses the bounding rectangle, and it rounds the same way its former does.
+        const bool roundCorners = (bobbin.get_column_shape() == MAS::ColumnShape::RECTANGULAR);
+        const bool corneredColumn = roundCorners ||
+                                    bobbin.get_column_shape() == MAS::ColumnShape::IRREGULAR;
         // OBLONG columns get a true STADIUM tube and bore (full rounding on the short
-        // axis), matching the stadium core column.
+        // axis), matching the stadium core column; rectangular keeps MKF's corner on the
+        // outside and a square bore.
         const bool oblong = (bobbin.get_column_shape() == MAS::ColumnShape::OBLONG);
-        // A rectangular or irregular tube's outer corners take the radius the
-        // winding engine bends the turns around (OpenMagnetics::Bobbin::
-        // get_column_corner_radius): the record's columnCornerRadius, else half the
-        // column thickness. This used to be a quarter of the tube's smaller side,
-        // which on a thin wall cut through the wall into the bore (0.146 in against
-        // a 0.035 in wall on one E bobbin), split the tube into four slabs, and put
-        // the tube's surface away from the turns MKF winds on it. The bore stays
-        // SQUARE so it still fits the square core column: rounding it would push
-        // bobbin material into the column corners.
         double rOuter = 0.0;
         if (oblong) {
             rOuter = 0.5 * std::min(outerWidth, outerDepth);
-        } else {
-            OpenMagnetics::Bobbin engineBobbin;
-            engineBobbin.set_processed_description(bobbin);
-            rOuter = engineBobbin.get_column_corner_radius();
+        }
+        else if (corneredColumn) {
+            OpenMagnetics::Bobbin bobbinForCorner;
+            bobbinForCorner.set_processed_description(bobbin);
+            rOuter = bobbinForCorner.get_column_corner_radius();
+            if (!(rOuter >= 0.0) || rOuter > 0.5 * std::min(outerWidth, outerDepth)) {
+                throw std::invalid_argument(
+                    "BobbinBuilder: column corner radius " + std::to_string(rOuter) +
+                    " m does not fit a " + std::to_string(outerWidth) + " x " +
+                    std::to_string(outerDepth) + " m column — inconsistent bobbin data");
+            }
         }
         const double rInner = oblong ? 0.5 * std::min(holeWidth, holeDepth) : 0.0;
 
@@ -257,8 +298,7 @@ TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescriptio
             // The engine has no flange corner radius. A rectangular flange keeps a
             // quarter of its smaller side: catalogue drawings of E bobbins show
             // rounded flanges, with no radius given.
-            const bool roundFlange = (bobbin.get_column_shape() == MAS::ColumnShape::RECTANGULAR);
-            const double rFlange = roundFlange ? 0.25 * std::min(flangeWidth, flangeDepth) : 0.0;
+            const double rFlange = roundCorners ? 0.25 * std::min(flangeWidth, flangeDepth) : 0.0;
 
             auto make_flange = [&](double zBottom, double thickness, const char* ctx) -> TopoDS_Shape {
                 double holeEps = thickness * 0.1;
@@ -287,6 +327,53 @@ TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescriptio
         gp_Trsf rot;
         rot.SetRotation(gp_Ax1(gp_Pnt(0,0,0), gp_Dir(1,0,0)), -std::numbers::pi / 2.0);
         bobbinShape = BRepBuilderAPI_Transform(bobbinShape, rot).Shape();
+    }
+
+    if (!pinRails.empty()) {
+        // ABT #1249: fuse MKF's pin rails with the bottom flange (see BobbinBuilder.h).
+        if (!axisIsY || !hasFlanges || bobbinShape.IsNull())
+            throw std::invalid_argument("BobbinBuilder: pin rails need a Y-axis former with flanges to hang from");
+        // The bottom flange sits below the lowest chamber, which is not at -height/2 when the
+        // chambers are off centre; the rotation to a Y axis carries z to y unchanged.
+        const double flangeFace = zLow - flangeThickness;
+        // The compound is the tube pieces, then the top flange, the bottom flange and the
+        // dividers, so a one-window bobbin is still body, top flange, bottom flange.
+        const std::size_t expectedSolids = tubeSpans.size() + 2 + gaps.size();
+        const std::size_t bottomFlange = tubeSpans.size() + 1;
+        std::vector<TopoDS_Shape> solids;
+        for (TopExp_Explorer exp(bobbinShape, TopAbs_SOLID); exp.More(); exp.Next()) solids.push_back(exp.Current());
+        if (solids.size() != expectedSolids)
+            throw std::runtime_error("BobbinBuilder: expected " + std::to_string(tubeSpans.size()) +
+                                     " tube piece(s), top flange, bottom flange and " + std::to_string(gaps.size()) +
+                                     " divider(s), got " + std::to_string(solids.size()) + " solids");
+        TopTools_ListOfShape arguments, tools;
+        arguments.Append(solids[bottomFlange]);
+        for (const auto& rail : pinRails) {
+            const double railTop = rail.centre[1] + rail.halfExtents[1];
+            if (std::abs(railTop - flangeFace) > 1e-9)
+                throw std::invalid_argument("BobbinBuilder: pin rail '" + rail.name + "' tops out at y = " +
+                                            std::to_string(railTop) + " m, not on the drawn bottom flange face y = " +
+                                            std::to_string(flangeFace) + " m");
+        }
+        for (auto& railShape : buildPinRailsNamed(pinRails, "rail")) tools.Append(railShape.shape);
+        BRepAlgoAPI_Fuse fuse;
+        fuse.SetArguments(arguments);
+        fuse.SetTools(tools);
+        fuse.Build();
+        checkIsDone(fuse, "bottom flange + pin rails");
+        std::size_t fusedSolids = 0;
+        for (TopExp_Explorer exp(fuse.Shape(), TopAbs_SOLID); exp.More(); exp.Next()) ++fusedSolids;
+        if (fusedSolids != 1)
+            throw std::runtime_error("BobbinBuilder: the bottom flange and its " + std::to_string(pinRails.size()) +
+                                     " pin rail block(s) fuse into " + std::to_string(fusedSolids) +
+                                     " solids; a rail that does not touch its flange would float in the model");
+        TopoDS_Shape fusedFlange;
+        for (TopExp_Explorer exp(fuse.Shape(), TopAbs_SOLID); exp.More(); exp.Next()) fusedFlange = exp.Current();
+        TopoDS_Compound comp;
+        BRep_Builder bld;
+        bld.MakeCompound(comp);
+        for (std::size_t i = 0; i < solids.size(); ++i) bld.Add(comp, i == bottomFlange ? fusedFlange : solids[i]);
+        bobbinShape = comp;
     }
 
     return bobbinShape;

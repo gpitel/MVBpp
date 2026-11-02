@@ -9,6 +9,13 @@
 
 namespace mvb {
 
+// The CONDUCTING cross-section of a MAS wire, {width, height} in metres: round -> {d, d};
+// rectangular/planar -> {w, h}; LITZ -> the bare bundle treated as one solid conductor, its
+// diameter from MKF's Wire::get_outer_diameter_bare_litz (capped by the catalogue outer
+// diameter). The single source of truth for what MVB++ draws as copper and what OMFEM's
+// level-set mesher carves; throws (no silent fallback) when the wire lacks the data.
+std::pair<double, double> conducting_dimensions(const MAS::Wire& wire);
+
 class TurnBuilder {
 public:
     // Context for a turn wound around a NON-MAIN core column (MAS multi-column placement:
@@ -35,8 +42,8 @@ public:
     static bool fuseTurnParts();
 
     // paintCoating: true  → turn solid drawn at the OUTER (insulation) footprint
-    //                       (default; unchanged behaviour for visualisation).
-    //               false → turn solid drawn at the CONDUCTING (copper) footprint
+    //                       (the web viewer asks for this explicitly).
+    //               false → turn solid drawn at the CONDUCTING (copper) footprint (DEFAULT)
     //                       — what FEM winding-loss extraction must mesh. For
     //                       LITZ this is the bare bundle treated as a single
     //                       solid conductor (diameter from MKF).
@@ -47,7 +54,7 @@ public:
                                   bool isToroidal,
                                   int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS,
                                   int wireRevolutionSegments = DEFAULT_WIRE_REVOLUTION_SEGMENTS,
-                                  bool paintCoating = true,
+                                  bool paintCoating = false,
                                   const std::optional<WoundColumnSpec>& woundColumn = std::nullopt);
 
     // Build a turn using ONLY the data on the Turn itself: coordinates,

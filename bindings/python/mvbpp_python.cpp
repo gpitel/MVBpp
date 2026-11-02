@@ -21,6 +21,8 @@
 
 #include "mvb/MagneticBuilder.h"
 #include "mvb/SectionBuilder.h"
+#include "mvb/SpacerBuilder.h"   // ABT #1170
+#include "mvb/ShuntBuilder.h"    // ABT #1176
 #include "mvb/SectionDrawing.h"
 #include "mvb/StepExporter.h"
 #include "mvb/Symmetry.h"
@@ -126,6 +128,10 @@ py::object deliver(std::vector<mvb::NamedShape> named,
                     double scale,
                     const std::string& symmetry,
                     const std::string& side) {
+    // Checked before the pipeline, so an empty build is not reported as the side filter's doing.
+    if (named.empty()) {
+        throw std::runtime_error("mvbpp: the builder produced no geometry to deliver");
+    }
     std::string m = upper(mode);
     if (m != "2D" && m != "3D") {
         throw std::runtime_error("mvbpp: mode must be '3D' or '2D' (got '" + mode + "')");
@@ -198,6 +204,42 @@ std::vector<mvb::NamedShape> build_core(const std::string& json_str, int polygon
     }
     mvb::MagneticBuilder b;
     return b.buildCoreNamed(core, polygonSegments);
+}
+
+// ABT #1170 (WP1): mirrors bindings/wasm/mvbpp_wasm.cpp's build_spacer, so the plastic shims
+// of an additive-gapped core can be drawn/exported from Python too — until now they existed
+// only in the WASM build.
+std::vector<mvb::NamedShape> build_spacer(const std::string& json_str, int /*polygonSegments*/) {
+    auto j = json::parse(json_str);
+    auto core = j.get<MAS::MagneticCore>();
+    auto gdOpt = core.get_geometrical_description();
+    if (!gdOpt || gdOpt->empty()) {
+        throw std::runtime_error(
+            "drawSpacer: MagneticCore.geometricalDescription is required. "
+            "Run MKF magnetic_autocomplete on the parent Magnetic first.");
+    }
+    std::vector<mvb::NamedShape> out;
+    mvb::appendSpacerSolids(out, core);
+    if (out.empty()) {
+        throw std::runtime_error(
+            "drawSpacer: this core has no spacers. Spacers exist only on an ADDITIVE "
+            "(spacer) gapping; a ground/distributed/residual gap has none.");
+    }
+    return out;
+}
+
+// ABT #1176 (WP7): the magnetic shunts of a Magnetic, drawn as the assembly draws them
+// (Shunt_<i>, Shunt_<i>_<k> per segment; MKF validates every sheet and its exceptions propagate).
+// Shunts live on the Magnetic, not on the core, so this takes a Magnetic JSON, and the core must
+// be processed (columns and gap coordinates) because MKF's shunt model reads them.
+std::vector<mvb::NamedShape> build_shunt(const std::string& json_str, int /*polygonSegments*/) {
+    auto j = json::parse(json_str);
+    OpenMagnetics::Magnetic magnetic(j.get<MAS::Magnetic>());
+    auto out = mvb::ShuntBuilder::buildShuntsNamed(magnetic);
+    if (out.empty()) {
+        throw std::runtime_error("drawShunt: this magnetic has no shunts (magnetic.shunts is absent or empty).");
+    }
+    return out;
 }
 
 std::vector<mvb::NamedShape> build_core_piece(const std::string& json_str, int polygonSegments) {
@@ -278,7 +320,13 @@ std::vector<mvb::NamedShape> build_magnetic(const std::string& json_str, int pol
         return b.buildAllNamed(magnetic, /*includeBobbin=*/true, /*symmetryPlanes=*/0,
                                polygonSegments, polygonSegments, paintCoating,
                                /*emitCoatingShells=*/false, /*includeInsulation=*/false,
-                               /*coreCoatingThickness=*/0.0, /*useRealWindingGeometry=*/true,
+                               // The declared core coating, drawn as its own solid. This binding
+                               // reaches buildAllNamed directly, so it has to make the same call
+                               // MagneticBuilder::drawMagnetic makes -- otherwise a coated core
+                               // draws bare in every consumer that goes through the bindings,
+                               // which is every 3D viewer.
+                               mvb::MagneticBuilder::declaredCoreCoatingThickness(magnetic.get_core()),
+                               /*useRealWindingGeometry=*/true,
                                femReady);
     }
     auto magnetic = j.get<MAS::Magnetic>();
@@ -352,6 +400,8 @@ Inputs are MAS-1.0 JSON strings.
 3D/2D draw functions
 --------------------
     mvbpp.drawCore       (core_json,        outputPath=None, *, mode="3D", plane="XY", offset=0.0, format="step", scale=1.0, polygonSegments=32)
+    mvbpp.drawSpacer     (core_json,        outputPath=None, *, mode="3D", plane="XY", offset=0.0, format="step", scale=1.0, polygonSegments=32)
+    mvbpp.drawShunt      (magnetic_json,    outputPath=None, *, mode="3D", plane="XY", offset=0.0, format="step", scale=1.0, polygonSegments=32)
     mvbpp.drawCorePiece  (core_shape_json,  outputPath=None, *, mode="3D", plane="XY", offset=0.0, format="step", scale=1.0, polygonSegments=32)
     mvbpp.drawBobbin     (bobbin_json,      outputPath=None, *, mode="3D", plane="XY", offset=0.0, format="step", scale=1.0, polygonSegments=32)
     mvbpp.drawTurns      (turns_json,       outputPath=None, *, mode="3D", plane="XY", offset=0.0, format="step", scale=1.0, polygonSegments=32, paintCoating=True)
@@ -460,6 +510,8 @@ Notes
     };
 
     def_draw("drawCore",       &build_core);
+    def_draw("drawSpacer",     &build_spacer);   // ABT #1170
+    def_draw("drawShunt",      &build_shunt);    // ABT #1176
     def_draw("drawCorePiece",  &build_core_piece);
     def_draw("drawBobbin",     &build_bobbin);
     def_draw_paint("drawTurns",    &build_turns);
@@ -497,9 +549,37 @@ Notes
           py::arg("polygonSegments") = mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
           py::arg("symmetry") = std::string("none"),
           py::arg("side") = std::string("+X+Y+Z"),
-          py::arg("paintCoating") = true,
+          // ABT #1261 (Alf, 2026-09-17): CD is the default everywhere; only the web
+          // browser asks for the coated footprint, and it does so explicitly.
+          py::arg("paintCoating") = false,
           py::arg("useRealWindingGeometry") = false,
           py::arg("femReady") = false);
+
+    // ABT #1215: terminal-lead copper length per winding, measured on the finished real-winding
+    // centreline (same enrichment and settings as drawMagnetic(useRealWindingGeometry=True)).
+    // Returns {"winding_<name>": {"terminal_lead_length_m", "parallels", "ends": [...]}}; with
+    // outputPath (the STEP path) it also writes the <stem>.leads.json sidecar next to it.
+    m.def("measureTerminalLeadLengths",
+          [](const std::string& json_str, py::object outputPath, int polygonSegments,
+             bool paintCoating, bool femReady) {
+              auto j = json::parse(json_str);
+              mvb::MagneticBuilder b;
+              auto magnetic = mvb::magnetic_autocomplete_safe(j, /*useRealWindingGeometry=*/true);
+              const auto leads = b.measureTerminalLeadLengths(
+                  magnetic, paintCoating, femReady, polygonSegments, polygonSegments,
+                  mvb::MagneticBuilder::declaredCoreCoatingThickness(magnetic.get_core()));
+              if (!outputPath.is_none())
+                  mvb::MagneticBuilder::writeTerminalLeadSidecar(
+                      leads, py::str(outputPath).cast<std::string>());
+              return py::module_::import("json").attr("loads")(
+                  mvb::MagneticBuilder::terminalLeadLengthsToJson(leads).dump());
+          },
+          py::arg("json_str"),
+          py::arg("outputPath") = py::none(),
+          py::kw_only(),
+          py::arg("polygonSegments") = mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
+          py::arg("paintCoating") = false,
+          py::arg("femReady") = true);
 
     // drawWinding takes an extra positional `windingName`.
     m.def("drawWinding",

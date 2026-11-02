@@ -122,23 +122,12 @@ static std::pair<double, double> get_conducting_dimensions(const MAS::Wire& wire
             return {d, d};
         }
         case MAS::WireType::RECTANGULAR:
-        case MAS::WireType::PLANAR:
-        // A foil turn's section is a rectangle: conductingWidth is the sheet's thickness (radial)
-        // and conductingHeight its strip width (axial), the same order as a rectangular wire.
-        // What sets foil apart -- its edges, and the winder cutting it to the section -- matters
-        // to the losses, not to the drawing.
-        case MAS::WireType::FOIL: {
+        case MAS::WireType::PLANAR: {
             auto cw = wire.get_conducting_width();
             auto ch = wire.get_conducting_height();
             if (!cw || !ch) {
-                // A catalogue foil states its thickness only; MKF sizes the strip when it winds,
-                // on its own copy of the wire, so the coil's record can still lack the height.
-                // The message names the type: the real-winding battery files any "FOIL wire"
-                // refusal as the known foil gap, and a rectangular wire must not hide there.
-                const std::string kind = wire.get_type() == MAS::WireType::FOIL
-                                             ? "FOIL" : "RECTANGULAR/PLANAR";
                 throw std::runtime_error(
-                    "get_conducting_dimensions: " + kind + " wire '" + wireName
+                    "get_conducting_dimensions: RECTANGULAR/PLANAR wire '" + wireName
                     + "' has no conductingWidth / conductingHeight");
             }
             return {resolve_dim_or_throw(*cw, "wire '" + wireName + "' conductingWidth"),
@@ -179,10 +168,35 @@ static std::pair<double, double> get_conducting_dimensions(const MAS::Wire& wire
             }
             return {bundleDiameter, bundleDiameter};
         }
+        case MAS::WireType::FOIL: {
+            // ABT #208 (2026-08-23): a foil turn IS a swept thin rectangle -- conductingWidth is
+            // the foil thickness (radial), conductingHeight the sheet height (axial), exactly the
+            // frame the RECTANGULAR path already sweeps (dimensions[0]=width=RADIAL,
+            // dimensions[1]=height=AXIAL). The 2KW-IH user MAS carries 0.4 x 33 mm, an 82:1
+            // section, and the rect profile/revolve handles any aspect ratio. The former throw
+            // here declared FOIL "not a swept section", which was true of the never-written
+            // dedicated sheet builder but not of the geometry: per-turn drawing needs nothing a
+            // rectangle does not have. REAL WINDING still refuses foil explicitly
+            // (ConductorBuilder: a continuous foil conductor is a genuinely different
+            // construction); this covers the ideal per-turn path the 3D viewer uses.
+            auto cw = wire.get_conducting_width();
+            auto ch = wire.get_conducting_height();
+            if (!cw || !ch) {
+                throw std::runtime_error(
+                    "get_conducting_dimensions: FOIL wire '" + wireName
+                    + "' has no conductingWidth / conductingHeight");
+            }
+            return {resolve_dim_or_throw(*cw, "FOIL wire '" + wireName + "' conductingWidth"),
+                    resolve_dim_or_throw(*ch, "FOIL wire '" + wireName + "' conductingHeight")};
+        }
         default:
             throw std::runtime_error(
                 "get_conducting_dimensions: unsupported wire type for wire '" + wireName + "'");
     }
+}
+
+std::pair<double, double> conducting_dimensions(const MAS::Wire& wire) {
+    return get_conducting_dimensions(wire);
 }
 
 // Resolve the wire cross-section used to build a turn solid.
@@ -214,10 +228,11 @@ static std::pair<double, double> get_wire_dimensions(const MAS::Wire& wire, cons
     return {d, d};
 }
 
-// FOIL is here too: without it a foil turn would sweep a circle of the sheet's thickness.
 static bool is_rectangular_wire(const MAS::Wire& wire) {
-    return wire.get_type() == MAS::WireType::RECTANGULAR || wire.get_type() == MAS::WireType::PLANAR
-           || wire.get_type() == MAS::WireType::FOIL;
+    // FOIL dispatches the rectangular profile too (ABT #208): thickness x height IS its section.
+    return wire.get_type() == MAS::WireType::RECTANGULAR ||
+           wire.get_type() == MAS::WireType::PLANAR ||
+           wire.get_type() == MAS::WireType::FOIL;
 }
 
 static TopoDS_Face build_circle_profile(const gp_Ax2& plane, double radius, int segments = 16) {

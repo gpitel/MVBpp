@@ -2,13 +2,41 @@
 
 #include "MAS.hpp"
 #include "mvb/NamedShape.h"
+#include "mvb/TurnBuilder.h"
 #include "mvb/Utils.h"
+#include "mvb/WireAssembler.h"
 #include <TopoDS_Shape.hxx>
+#include <gp_Trsf.hxx>
+#include <array>
+#include <cstdlib>
+#include <limits>
+#include <map>
+#include <optional>
+#include <utility>
+#include <string>
 #include <vector>
 
-namespace OpenMagnetics { class Coil; }
+namespace OpenMagnetics { class Coil; struct ConnectionReservedSpace; }
 
 namespace mvb {
+
+// What the enamel gate (ConductorBuilder's collision check over the finished paths) proved
+// about one build. Only Certified is a proof: every pair of primitives of DISTINCT conductors
+// was shown at or beyond its coated envelope, so no two conductors share volume. A consumer
+// that relies on that proof (OMFEM skips welding a winding's parallels, which cannot overlap
+// when this holds) must treat every other value as "not proven". NotRun is the value a build
+// starts at, so a verdict nobody set -- a throw, an early return, a path that never reached
+// the gate -- is visible as such and never reads as a pass. Open to extension: a new gate
+// outcome gets its own value, never a reuse of Certified.
+enum class EnamelGateVerdict {
+    NotRun,           // the gate did not complete in this build
+    Certified,        // every distinct-conductor pair proven at/beyond its coated envelope
+    SampledOnly,      // clear except BLEND-involved pairs, which are sampled, not proven
+    ReportedAllowed,  // certified intrusions found and let through by MVB_ALLOW_ENAMEL
+    Skipped,          // collision debug switch on (diagnosticSkipCollisionCheck,
+                      // MVB_SKIP_COLLISION_CHECK: the gates run but REPORT, so nothing is
+                      // certified) or the gate skipped (MVB_LEAD_NO_VALIDATE)
+};
 
 // Real-winding geometry: ONE continuous copper body per (winding, parallel), replacing
 // TurnBuilder's independent closed loops when DrawConfig::useRealWindingGeometry is on.
@@ -27,19 +55,284 @@ namespace mvb {
 // rectangular, planar and foil wire. A foil turn is swept as a rectangle.
 class ConductorBuilder {
 public:
+    // ---- ABT #1172/#1237: THE BEND POLICY MKF PLANS PIN RUNS FOR ----------------------------
+    // MKF routes a lead to its pin as straight legs meeting at an obstacle edge, and offsets each
+    // leg off the faces (d >= R - (R - r) sin(theta/2)) for the centreline bend radius the CONSUMER
+    // declares. Declared by nobody, it plans SHARP corners, and MVB++ -- which must round every
+    // corner (OCC cannot sweep a bend at or under the wire radius) -- would cut the edge and put
+    // copper inside the pin rail.
+    //
+    // The routes are planned lazily, when someone asks the coil for its connection layout or
+    // reserved spaces. So the policy has to be declared FOR AS LONG AS THE COIL IS HELD, not once
+    // at enrichment: every ConductorBuilder entry point declares it for the duration of the build.
+    // A caller that reads MKF's routes ITSELF (to compare against what was drawn) must hold one of
+    // these over that read, or it will read sharp-planned routes and disagree with the drawing by
+    // the leg offset. RAII; restores the previous settings on every path out.
+    class LeadBendPolicy {
+    public:
+        explicit LeadBendPolicy(double minBendRadius = Options_minBendRadiusDefault());
+        ~LeadBendPolicy();
+        LeadBendPolicy(const LeadBendPolicy&) = delete;
+        LeadBendPolicy& operator=(const LeadBendPolicy&) = delete;
+    private:
+        std::optional<double> _previousFactor;
+        std::optional<double> _previousMinimum;
+    };
+    // The MVB_MIN_BEND_RADIUS floor Options() would pick up, without constructing one (Options is
+    // declared below).
+    static double Options_minBendRadiusDefault();
+
+    // ---- ABT #1248: HOW A WOUND TOROID IS MOUNTED -------------------------------------------
+    // The conductor builder works in the BUILD frame MKF's geometricalDescription gives a toroid:
+    // hole axis along +Y, ring in the XZ plane, a MAS crossing (cx, cy) at build (cx, 0, cy).
+    // The exported assembly is that frame moved rigidly by `toExported`:
+    //   HORIZONTAL: identity. The ring lies flat (hole axis Y). Every terminal lead drops in -Y.
+    //   VERTICAL (MKF Settings toroid_mounting default): the ring stands on its rim, hole axis Z,
+    //     ring plane XY with Y up: Rx(-pi/2) (build (x, y, z) -> (x, z, -y), the MAS frame)
+    //     followed by Rz(phi) about the hole axis, phi chosen so the build-frame `down` maps to -Y.
+    //     Every terminal lead leaves its crossing's axial leg straight along `down`.
+    // Either way every terminal cap ends up in one XZ plane of the exported frame, normal -Y.
+    enum class ToroidMounting { Vertical, Horizontal };
+    struct ToroidMountingFrame {
+        ToroidMounting mounting = ToroidMounting::Vertical;
+        std::array<double, 3> down{0.0, -1.0, 0.0};   // build frame, unit
+        gp_Trsf toExported;                           // build frame -> exported frame
+    };
+    // `down` for VERTICAL: the part is turned about the hole axis so its terminals sit at the
+    // bottom -- `down` is the direction of the sum of the unit vectors of every conductor's first
+    // and last turn crossing (the rotation that minimises the summed height of the terminals, so
+    // the total drop copper). When that sum vanishes (a mirror-symmetric multi-winding part, e.g.
+    // a 2-winding CMC whose terminals sit in the two gaps between its windings, where every
+    // rotation gives the same total) the tie is broken by the windings: the first winding's
+    // centroid goes to the LEFT (-X), so a 2-winding CMC shows one winding on each side with the
+    // gaps top and bottom. A part with neither a terminal side nor a winding side throws.
+    // `windingOrder` is coil.functionalDescription order; `turns` is coil.turnsDescription.
+    static ToroidMountingFrame resolveToroidMountingFrame(ToroidMounting mounting,
+                                                          const std::vector<MAS::Turn>& turns,
+                                                          const std::vector<std::string>& windingOrder);
+
     struct Options {
-        Options() {}
+        Options() {
+            if (std::getenv("MVB_TOROID_MITRE_CORNERS")) toroidMitreCorners = true;
+            minBendRadius = Options_minBendRadiusDefault();
+        }
         int  wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS;
-        // true  -> conductor swept at the OUTER (insulation) footprint (visualisation)
-        // false -> swept at the CONDUCTING (copper) footprint (FEM)
-        bool paintCoating = true;
+        // true  -> conductor swept at the OUTER (insulation) footprint (the web viewer)
+        // false -> swept at the CONDUCTING (copper) footprint (DEFAULT, ABT #1261).
+        // Alf, 2026-09-17: "use CD for Ansys, and always use CD as default. We will use OD
+        // in the web browser." The copper is what carries the current, and drawing it at the
+        // coated envelope both fattens every conductor (0.430 mm against a 0.400 mm wire on
+        // 02_flyback: 1.156x the area) and leaves neighbouring wires EXACTLY tangent, because
+        // MKF lays turns at a pitch of one OD. At the conducting footprint the enamel that
+        // pitch reserves becomes real air between the solids.
+        bool paintCoating = false;
+        // ONE corner style for every corner of a terminal lead (Alf, 2026-10-28: "make them all either
+        // round or rectangular ... a setting that we can configure"): the joints of the lead polyline
+        // (lead/connection segments) AND the terminal corner where the lead leaves its turn (the
+        // TerminalFillet biarc). 14_dab mixed the two -- mitred 'exit lead seg 0'/'seg 1' against a
+        // filleted '(terminal stub) fillet arc' -- and they collided.
+        //   true (DEFAULT, round) -> every such corner is an exact tangent fillet arc. A corner whose
+        //        legs cannot hold its fillet THROWS (it used to fall back to a mitre, which is how
+        //        06_llc's three parallels showed three different exit joints, ABT #685).
+        //   false (sharp)         -> every such corner is a bisection mitre: plain segments meeting at
+        //        the waypoint, and the lead meets its turn with no terminal fillet.
+        // Rectangular / planar wire is always round whatever this says: its single fixed-binormal
+        // sweep cannot close a sharp spine (Alf, 2026-10-28). DrawConfig::roundedLeadCorners sets it.
+        bool roundedLeadCorners = true;
+        // TOROID turn corners: false (default) = the round tangent fillets (today's certified
+        // construction); true = sharp MITRE corners -- five straight runs per turn joined on
+        // 45-degree bisector planes (Alf, 2026-08-27). Mitres trade the fillets' osculating
+        // tangent junctions (OCC's worst contact class) for transversal plane joints, and at
+        // segments > 0 every piece becomes an exact boolean-free polygon prism. Env:
+        // MVB_TOROID_MITRE_CORNERS=1.
+        bool toroidMitreCorners = false;
+        // MINIMUM BEND RADIUS for every drawn corner/fillet, in METRES (Alf, 2026-08-27:
+        // "a setting that is the minimum radius in any turn"). 0 (default) keeps each site's
+        // own policy radius (kRoundCornerBendFactor x wire radius, 1.02 x wireRadius for rect
+        // stations, 1.5 x wireRadius for lead fillets). A positive value FLOORS every one of
+        // those choices: effectiveBend() below is the single chokepoint, so no corner anywhere
+        // can be drawn tighter than this. It can only widen a bend, never tighten one -- a
+        // radius below the wire's own is a horn torus OCC cannot build, and that guard stays.
+        // Configure via ConductorBuilder::Options, the MVB_MIN_BEND_RADIUS env (metres), or the
+        // step generator's --min-bend-radius flag.
+        double minBendRadius = 0.0;
+        // ABT #1265: build the conductor for use as a CUTTING TOOL -- the conformal assembler
+        // emits its pieces unwelded. A cutter carves the same volume whether or not its pieces
+        // are one solid (this file's own note: "a cutting tool needs no welds, no mitre
+        // certification and may overlap itself"), and the weld is the most expensive step in
+        // the build.
+        bool cutterOnly = false;
+        // ABT #1265 (Alf, 2026-09-19: "try to actually have an object per wire to simulate in
+        // FEM ... making sure the proper connection sections are identified correctly").
+        // ONE SOLID PER (winding, parallel), LEADS INCLUDED. The conformal assembly leaves a
+        // conductor as several abutting bodies -- its lead segments always (a lead meets its
+        // wrap at a MITRE, and mitres are never bridged) and its chain wherever a weld was
+        // refused. A real wire is one piece of copper, and an FEM solver wants one current
+        // path, so the emitter closes the assembly with a single glued fuse over every solid of
+        // the conductor. Offered, never forced: the result must be ONE valid solid conserving
+        // volume, or the conductor stays exactly as the assembler built it.
+        // The terminal caps survive this by construction -- the port faces are matched to the
+        // PATH's two free ends over the faces of the finished shape, not to separate solids, so
+        // fusing the bodies does not move or remove them.
+        // FEM product only; a viewer gains nothing from it and a cutting tool even less.
+        bool oneBodyPerConductor = true;
+        // How each real-winding conductor's pieces are welded (see WeldMode in WireAssembler.h).
+        // Off also skips the closing one-body fuse above. Default: the environment's
+        // (MVB_WELD_ALL -> All, else Auto), so the step tools and the mesh recipe keep working.
+        WeldMode weld = weldModeFromEnv();
+        double effectiveBend(double policyBend) const {
+            return policyBend < minBendRadius ? minBendRadius : policyBend;
+        }
         // false (OM / drawing) -> fast per-run compound: overlapping swept pipes, perfect for the
         //   3D viewer, seconds to build.
         // true  (FEM export)   -> the slow one-piece machinery: single continuous body per parallel
         //   where a sweep closes (columns, sparse toroids), a conformal mitre-jointed compound for
         //   dense toroids, fuse for single-turns. Meshable (no self-overlap) but far slower.
         bool femReady = false;
+        // Azimuth (radians, azPointC convention: az -> (x = r cos az, z = -r sin az)) the
+        // terminal leads should EXIT through -- the core's winding-window OPENING. NAN =
+        // keep the default (az = pi/2, the -Z direction). Cores whose lateral legs cover
+        // -Z (PQ, EP, ...) MUST redirect the leads or they terminate inside the core plate
+        // (measured on 03_buck_pq3230: the lead tip landed exactly on the oblique plate
+        // face and tetgen could not recover the contact edge).
+        double leadExitAzimuth = std::numeric_limits<double>::quiet_NaN();
+        // The CORE solids, for aiming the leads at the true window opening. Column metadata
+        // under-describes real cores (a PQ's plates wrap most of the perimeter, leaving only
+        // narrow slots); classifying the actual solids around the lead-tip radius finds the
+        // genuine free arc. Empty -> no aiming beyond leadExitAzimuth.
+        std::vector<TopoDS_Shape> coreObstacles;
+        // DIAGNOSTIC ONLY -- THE ONE "allow overlapping copper" switch (also
+        // MVB_SKIP_COLLISION_CHECK; mvbpp_step_generator --skip-collision-check). Every
+        // copper-collision refusal of the conductor build (copper/enamel gate, terminal-fillet
+        // proof, lead-fan clearances, toroid tilt certification, pin, port-plane and flange
+        // gates) is printed to stderr as a FINDING with its usual message instead of thrown,
+        // and the copper is left as drawn (nothing squished or moved). So the overlap can be
+        // LOOKED AT in CAD, with the list of what collides, instead of only read about in an exception. A
+        // collision means two pieces of copper occupy the same space: the result is not a
+        // manufacturable part and must never be exported as one, meshed, or handed to a
+        // solver. Nothing in the library sets this — only the tools and tests that exist to
+        // investigate a specific refusal (see the [realwinding][diagnostic] tests).
+        bool diagnosticSkipCollisionCheck = false;
+        // When non-null, buildAll writes the enamel gate's verdict for THIS build here. It is
+        // set to NotRun on entry and only overwritten by the gate's own outcome, so a build
+        // that throws leaves NotRun behind (see EnamelGateVerdict).
+        EnamelGateVerdict* enamelGateVerdictOut = nullptr;
+        // ABT #871 — MULTI-COLUMN PLACEMENT. Section name -> the core column that section's
+        // turns wrap, for the sections that do NOT wrap the main column. Resolved by the
+        // caller (MagneticBuilder::WoundColumnResolver reads the MAS placement chain
+        // section -> windingWindow -> column), because the column geometry lives on the CORE
+        // and this builder is only handed the coil and the bobbin.
+        //
+        // A conductor whose turns wrap a lateral leg is built in that leg's own frame — turn
+        // radials measured from the leg axis, the racetrack laid on the leg's half-dims —
+        // and the finished path is translated onto the leg. Sections absent from this map
+        // wrap the main column at the origin, which is every single-window design, so an
+        // empty map is byte-identical to the pre-#871 builder.
+        std::map<std::string, TurnBuilder::WoundColumnSpec> woundColumnPerSection;
+        // ABT #1173 (WP4): when non-null, a toroidal build writes the y of its common terminal
+        // plane here (NaN when the build has no toroidal conductor). A toroid on a base draws the
+        // base with its top face on that plane (BaseBuilder.h).
+        double* toroidTerminalPlaneOut = nullptr;
+        // ABT #1248: REQUIRED for a toroid (building one without it throws): the mounting the
+        // terminal leads are routed for. MagneticBuilder resolves it from MKF Settings
+        // toroid_mounting, overridden by a toroid base record's own base.mounting.
+        std::optional<ToroidMountingFrame> toroidMounting;
+        // ABT #1248: REQUIRED for a toroid: how deep the CORE (with its coating shell, when one is
+        // drawn) reaches along toroidMounting->down in the build frame, max over the core of p.down.
+        // The common terminal plane stays below it as well as below the copper: a standing ring's
+        // bare rim can sit lower than the copper next to its terminal gap.
+        double toroidCoreDepthAlongDown = std::numeric_limits<double>::quiet_NaN();
     };
+
+    // REAL-PATH POLYLINES: the fully-assembled, collision-checked conductor centrelines
+    // (wraps, links, Z end-runs, terminal leads -- everything emitConductor would sweep),
+    // sampled per primitive, WITHOUT building any solid. No booleans anywhere: this is the
+    // input for implicit (signed-distance / level-set) winding meshing, which sidesteps the
+    // OCC weld/fragment failure classes entirely (ABT #490/#491).
+    struct PathPolyline {
+        std::string name;                 // "<winding> parallel <k>"
+        double wireRadius = 0.0;          // round capsule radius (= half min dim for rect)
+        bool isRectangular = false;
+        double wireWidth = 0.0, wireHeight = 0.0;
+        // Per-primitive sampled points (metres). Distance = min over prims of the
+        // point-to-polyline capsule distance; per-prim grouping avoids phantom bridges
+        // between non-contiguous runs.
+        std::vector<std::vector<std::array<double, 3>>> prims;
+        // Parallel to prims: true for terminal-lead copper, by the ONE rule the lead-length report
+        // uses (Primitive::isLead or Primitive::terminalFillet, ABT #1215); false for turn copper.
+        std::vector<bool> primIsLead;
+        std::array<double, 3> end0{}, end1{};   // free ends (terminal port centres)
+        std::array<double, 3> dir0{}, dir1{};   // OUTWARD end tangents (port normals)
+        // ABT #1403: every junction between consecutive centreline pieces (all of them, including
+        // any a sample-less piece bounds), with the direction change and the verdict assembleWire
+        // applies to it (mvb::junctionVerdict). Kinds are Primitive::Kind values.
+        struct Junction {
+            std::string fromLabel, toLabel;
+            int fromKind = 0, toKind = 0;
+            double angle = 0.0;   // radians
+            JunctionVerdict verdict = JunctionVerdict::Tangent;
+        };
+        std::vector<Junction> junctions;
+    };
+    // TERMINAL-LEAD COPPER LENGTH (ABT #1215). What MVB++ actually draws beyond the turns, per
+    // winding, measured on the SAME finished centreline the conductor solids are swept from (the
+    // whole buildAll pipeline runs -- assembly, lead routing, terminal fillets, the toroid
+    // drop-to-plane, the collision gate -- and stops before any solid is built).
+    //
+    // WHAT COUNTS AS LEAD (one rule, flags only, no label matching):
+    //   - every primitive with Primitive::isLead: the toroid lead chain (axial stub out of the
+    //     hole, its round corner, the radial leg -- side-stepped at the rim when the router had
+    //     to -- the second round corner, the -Y drop to the terminal plane), the concentric exit
+    //     polylines and their fan legs, the concentric "lead corner" spirals and runs, foil
+    //     lead wires;
+    //   - every primitive with Primitive::terminalFillet: the fillet arcs TerminalFillet puts
+    //     where a concentric wrap's terminal stub meets its lead (they replace a piece of the
+    //     stub and a piece of the lead, and exist only because the lead is there).
+    // NOT lead: turn copper (wraps, terminal stubs, bumps), isConnection primitives (inter-layer
+    // links and their smoothing arcs, U/Z returns).
+    //
+    // WHICH END: a primitive's `terminal` tag (0 entrance, 1 exit) where the router set one
+    // (toroids); otherwise its position -- a lead primitive before the conductor's first
+    // non-lead primitive belongs to the entrance, after its last one to the exit. A lead piece
+    // between two turn pieces, or a tag that contradicts the position, THROWS. A conductor that
+    // is nothing but lead (a foil's soldered lead wire) takes its end from its construction.
+    //
+    // Lengths are exact (primLength); a lead piece without a closed-form length throws. A
+    // conductor whose emission re-shapes its lead corners after this measurement (the
+    // rectangular-wire per-primitive emitter inserts elbows between two straight lead legs)
+    // throws instead of reporting a number the solid does not have.
+    struct TerminalLeadEnd {
+        size_t parallel = 0;
+        std::string end;              // "entrance" | "exit"
+        double length_m = 0.0;
+        // One centreline primitive of this end, in path (current-flow) order, for audit: its
+        // label, kind ("SEG" | "ARC3" | "SPIRAL"), exact length, endpoints (metres, MVB++ frame),
+        // and for an ARC3 its bend radius and sweep (radians); both 0 for a SEG.
+        struct Piece {
+            std::string label;
+            std::string kind;
+            double length_m = 0.0;
+            std::array<double, 3> start{}, end{};
+            double radius_m = 0.0, sweep_rad = 0.0;
+        };
+        std::vector<Piece> pieces;
+    };
+    struct TerminalLeadLength {
+        double total_m = 0.0;         // summed over both ends of every parallel
+        size_t parallels = 0;
+        std::vector<TerminalLeadEnd> per_end;   // parallel ascending, entrance before exit
+    };
+    // Keyed by winding name. `opts` must be the options the conductors are (or were) built with:
+    // paintCoating changes the wire radius every bend is sized from, femReady changes which
+    // corners are filleted.
+    static std::map<std::string, TerminalLeadLength> measureTerminalLeadLengths(
+        const OpenMagnetics::Coil& coil, const MAS::CoreBobbinProcessedDescription& bobbin,
+        bool isToroidal, const Options& opts = {});
+
+    static std::vector<PathPolyline> buildAllPaths(const OpenMagnetics::Coil& coil,
+                                                   const MAS::CoreBobbinProcessedDescription& bobbin,
+                                                   bool isToroidal,
+                                                   const Options& opts = {});
 
     // Builds one solid per (winding, parallel), named "<winding> parallel <k>" (MAS style).
     // `coil` must be an MKF-wound coil (turnsDescription present, positions final);
@@ -54,5 +347,28 @@ public:
                                             bool isToroidal,
                                             const Options& opts = {});
 };
+
+// How MVB++ reads one of MKF's drawn terminal rects (width radial x height axial): an AXIAL stub
+// along the window edge, or a RADIAL run. MKF draws a box one wire thick across its travel, so
+// for a round wire the long side is the travel. A rectangular wire is one wire WIDTH wide on its
+// stub and one wire HEIGHT tall on its run, so the rect is a stub when it is longer than the wire
+// is tall by more than it is wider than the wire is wide (a sleeve adds the same to both and
+// cancels); a 5.65 x 3.77 mm stub of a 5.645 x 0.4725 mm strip is no run. A foil's rects are all
+// sheet-tall, so its stub is the one a sheet thickness wide.
+struct LeadRectReading {
+    double foilRadial = 0.0;    // the sheet's radial thickness; 0 for any other wire
+    double wireWidth = 0.0;     // a rectangular wire's drawn section; 0 x 0 = round (aspect rule)
+    double wireHeight = 0.0;
+};
+bool leadRectIsAxial(double width, double height, const LeadRectReading& reading = {});
+
+// Split one conductor's drawn terminal rects into its ENTRANCE and EXIT lead groups by the
+// ConnectionKind MKF tags each rect with (TERMINAL_ENTRANCE / TERMINAL_EXIT), never by emission
+// order or proximity. Throws on any other kind, on an exit lead without an entrance lead, and on a
+// single drawn lead unless MVB_SYNTHESIZE_MISSING_LEAD is set (then the exit group is empty).
+std::pair<std::vector<const OpenMagnetics::ConnectionReservedSpace*>,
+          std::vector<const OpenMagnetics::ConnectionReservedSpace*>>
+splitTerminalGroups(const std::vector<const OpenMagnetics::ConnectionReservedSpace*>& terminalRects,
+                    const std::string& who, const LeadRectReading& foilRadial = {});
 
 } // namespace mvb

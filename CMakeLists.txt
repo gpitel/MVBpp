@@ -16,8 +16,48 @@ include(ExternalProject)
 # ============================================================================
 # OpenCASCADE 7.9.3 — build from source, minimal configuration
 # ============================================================================
-set(OCCT_PREFIX "${CMAKE_BINARY_DIR}/occt-install")
+# OCCT install location. Deliberately OUTSIDE the build tree by default: OCCT takes ~20 minutes
+# to compile, and putting it under build/ meant (a) any build-tree wipe destroyed it, and (b) every
+# clean build produced a FRESH OCCT binary -- so the geometry kernel underneath the whole pipeline
+# was not reproducible from one build to the next. A shared, built-once install makes OCCT a fixed
+# input rather than a per-build variable. Override with -DOCCT_PREFIX=... to isolate a build.
+set(OCCT_PREFIX "$ENV{HOME}/OpenMagnetics/occt-7.9.3-install"
+    CACHE PATH "OCCT 7.9.3 install prefix (shared across build trees; built once)")
 
+# The toolkits MVB++ links. This list is the SINGLE SOURCE OF TRUTH: the ExternalProject's
+# BUILD_BYPRODUCTS below is derived from it, so the two can never drift apart. They HAD drifted --
+# BUILD_BYPRODUCTS named 27 toolkits while this list links 46 -- which made a FROM-SCRATCH Ninja
+# build impossible: ninja refuses a link input that neither exists nor has a rule ("libTKV3d.a,
+# needed by libmvb++.so, missing and no known rule to make it"). It only ever worked because a
+# previously-built occt-install was already on disk; wiping the build tree exposed it.
+set(OCCT_ESSENTIAL_LIBS
+    TKernel TKMath TKG2d TKG3d TKGeomBase TKBRep
+    TKGeomAlgo TKTopAlgo TKPrim TKBO TKBool TKMesh TKShHealing
+    TKCDF TKLCAF TKXSBase TKXCAF TKCAF TKVCAF TKBin TKXml TKStd
+    TKOffset TKRWMesh TKDESTEP TKDEIGES TKDESTL
+    TKV3d TKService TKHLR TKFillet TKFeat
+    TKBinL TKStdL TKXmlL TKBinXCAF TKXmlXCAF
+    TKDE TKDECascade
+    TKTObj TKBinTObj TKXmlTObj
+    TKDEGLTF TKDEOBJ TKDEPLY TKDEVRML
+)
+set(OCCT_BYPRODUCTS "")
+foreach(_l ${OCCT_ESSENTIAL_LIBS})
+    list(APPEND OCCT_BYPRODUCTS "${OCCT_PREFIX}/lib/lib${_l}.a")
+endforeach()
+
+# A prefix that already holds every toolkit is reused, never rebuilt: re-running the
+# ExternalProject from a fresh build tree reinstalls OCCT over a prefix other builds are linking.
+set(_occt_installed TRUE)
+foreach(_b ${OCCT_BYPRODUCTS})
+    if(NOT EXISTS "${_b}")
+        set(_occt_installed FALSE)
+    endif()
+endforeach()
+if(_occt_installed)
+    message(STATUS "OCCT: reusing the install at ${OCCT_PREFIX}")
+    add_custom_target(occt_external)
+else()
 ExternalProject_Add(
     occt_external
     URL https://github.com/Open-Cascade-SAS/OCCT/archive/refs/tags/V7_9_3.tar.gz
@@ -41,53 +81,16 @@ ExternalProject_Add(
         -DCMAKE_INSTALL_PREFIX=${OCCT_PREFIX}
         -DINSTALL_DIR_LIB=lib
         -DINSTALL_DIR_INCLUDE=include/opencascade
-    BUILD_BYPRODUCTS
-        ${OCCT_PREFIX}/lib/libTKernel.a
-        ${OCCT_PREFIX}/lib/libTKMath.a
-        ${OCCT_PREFIX}/lib/libTKG2d.a
-        ${OCCT_PREFIX}/lib/libTKG3d.a
-        ${OCCT_PREFIX}/lib/libTKGeomBase.a
-        ${OCCT_PREFIX}/lib/libTKBRep.a
-        ${OCCT_PREFIX}/lib/libTKGeomAlgo.a
-        ${OCCT_PREFIX}/lib/libTKTopAlgo.a
-        ${OCCT_PREFIX}/lib/libTKPrim.a
-        ${OCCT_PREFIX}/lib/libTKBO.a
-        ${OCCT_PREFIX}/lib/libTKBool.a
-        ${OCCT_PREFIX}/lib/libTKMesh.a
-        ${OCCT_PREFIX}/lib/libTKShHealing.a
-        ${OCCT_PREFIX}/lib/libTKCDF.a
-        ${OCCT_PREFIX}/lib/libTKLCAF.a
-        ${OCCT_PREFIX}/lib/libTKXSBase.a
-        ${OCCT_PREFIX}/lib/libTKXCAF.a
-        ${OCCT_PREFIX}/lib/libTKCAF.a
-        ${OCCT_PREFIX}/lib/libTKVCAF.a
-        ${OCCT_PREFIX}/lib/libTKBin.a
-        ${OCCT_PREFIX}/lib/libTKXml.a
-        ${OCCT_PREFIX}/lib/libTKStd.a
-        ${OCCT_PREFIX}/lib/libTKOffset.a
-        ${OCCT_PREFIX}/lib/libTKRWMesh.a
-        ${OCCT_PREFIX}/lib/libTKDESTEP.a
-        ${OCCT_PREFIX}/lib/libTKDEIGES.a
-        ${OCCT_PREFIX}/lib/libTKDESTL.a
+    BUILD_BYPRODUCTS ${OCCT_BYPRODUCTS}
     USES_TERMINAL_BUILD TRUE
 )
+endif()
 
 add_library(occt INTERFACE)
 add_dependencies(occt occt_external)
 target_include_directories(occt INTERFACE ${OCCT_PREFIX}/include/opencascade)
 target_link_directories(occt INTERFACE ${OCCT_PREFIX}/lib)
 
-set(OCCT_ESSENTIAL_LIBS
-    TKernel TKMath TKG2d TKG3d TKGeomBase TKBRep
-    TKGeomAlgo TKTopAlgo TKPrim TKBO TKBool TKMesh TKShHealing
-    TKCDF TKLCAF TKXSBase TKXCAF TKCAF TKVCAF TKBin TKXml TKStd
-    TKOffset TKRWMesh TKDESTEP TKDEIGES TKDESTL
-    TKV3d TKService TKHLR TKFillet TKFeat
-    TKBinL TKStdL TKXmlL TKBinXCAF TKXmlXCAF
-    TKDE TKDECascade
-    TKTObj TKBinTObj TKXmlTObj
-    TKDEGLTF TKDEOBJ TKDEPLY TKDEVRML
-)
 # OCCT 7.9.3 toolkits have circular dependencies (e.g. TKGeomAlgo <-> TKMath),
 # which no single left-to-right ordering of static archives can satisfy — GNU ld
 # would drop symbols pulled later (undefined references to math_FunctionSet,
@@ -134,24 +137,21 @@ set(INCLUDE_PYMKF     OFF CACHE BOOL "" FORCE)
 set(ENABLE_MATPLOTPP  OFF CACHE BOOL "" FORCE)
 set(ENABLE_NGSPICE    OFF CACHE BOOL "" FORCE)
 
-# MKF main on GitHub depends on a MAS commit that is local-only (not yet pushed).
-# Use file:// clones from the local repos so FetchContent pulls the exact working
-# versions.  Switch both to https://github.com/OpenMagnetics/{MAS,MKF}.git once
-# the pending MAS commit is pushed.
+# Both repos are fetched from GitHub: the commits MVB++ needs (MAS febef0f with
+# the bobbin base/divider schema, MKF 6b23d51a with Bobbin::get_pin_rails and
+# Coil::terminal_exit_slots) are pushed, so the build no longer has to read the
+# developer's local clones -- which may be dirty or mid-rebase in a shared box.
 # Overridable so the native build can be pointed at a fork or a local clone
 # (e.g. -D MVBPP_MKF_REPOSITORY=file:///path/to/MKF -D MVBPP_MKF_TAG=my-branch).
 # Defaults are unchanged. Mirrors bindings/wasm/CMakeLists.txt.
-set(MVBPP_MAS_REPOSITORY "file:///home/alf/OpenMagnetics/MAS"
+set(MVBPP_MAS_REPOSITORY "https://github.com/OpenMagnetics/MAS.git"
     CACHE STRING "Git repository or file:// path to fetch MAS from")
-set(MVBPP_MKF_REPOSITORY "file:///home/alf/OpenMagnetics/MKF"
+set(MVBPP_MKF_REPOSITORY "https://github.com/OpenMagnetics/MKF.git"
     CACHE STRING "Git repository or file:// path to fetch MKF from")
 set(MVBPP_MAS_TAG "main" CACHE STRING "Git ref to check out for MAS")
 set(MVBPP_MKF_TAG "main" CACHE STRING "Git ref to check out for MKF")
 
 set(_MAS_LOCAL "${MVBPP_MAS_REPOSITORY}")
-# MKF's drum-family commits (dc046242..) are local-only too: they need the MAS
-# openShape schema, whose push is blocked on the MAS LFS budget (ABT #296).
-# Switch back to https://github.com/OpenMagnetics/MKF.git once both are pushed.
 set(_MKF_LOCAL "${MVBPP_MKF_REPOSITORY}")
 
 FetchContent_Declare(
@@ -183,6 +183,9 @@ FetchContent_Declare(
     GIT_SHALLOW    FALSE
     GIT_SUBMODULES ""
 )
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/MkfCheckout.cmake)
+# Take configure's own edits back out so the update step sees a clean checkout (see there).
+mvbpp_mkf_unplant("${_MKF_SRC}")
 FetchContent_GetProperties(MKF)
 if(NOT mkf_POPULATED)
     FetchContent_Populate(MKF)
@@ -243,16 +246,25 @@ add_library(mvb++ ${_mvbpp_lib_kind}
     src/SectionDrawing.cpp
     src/ProjectionDrawing.cpp
     src/SpacerBuilder.cpp
+    src/PinBuilder.cpp
+    src/BaseBuilder.cpp
+    src/ShuntBuilder.cpp
     src/FR4Builder.cpp
     src/StepExporter.cpp
     src/Symmetry.cpp
     src/Utils.cpp
     src/TurnBuilder.cpp
     src/ConductorBuilder.cpp
+    src/TerminalFillet.cpp
+    # ABT #685: the ONE centreline -> copper assembler. Real-winding Coil geometry reaches
+    # OCCT only through this TU (Alf's rule); the six chunk primitives emit centrelines.
+    src/WireAssembler.cpp
     src/BobbinBuilder.cpp
     src/shapes/ShapeBuilder.cpp
     src/shapes/ShapeDrum.cpp
     src/shapes/ShapeDrumRing.cpp
+    src/shapes/ShapeMolded.cpp
+    src/shapes/ShapeDrumSemishielded.cpp
     src/shapes/ShapeE.cpp
     src/shapes/ShapeEp.cpp
     src/shapes/ShapeEpx.cpp
@@ -268,6 +280,7 @@ add_library(mvb++ ${_mvbpp_lib_kind}
     src/shapes/ShapeUi.cpp
     src/shapes/ShapeUr.cpp
     src/shapes/ShapeUt.cpp
+    src/shapes/ShapeSlab.cpp
     src/shapes/Factory.cpp
 )
 set_target_properties(mvb++ PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -290,6 +303,14 @@ target_link_libraries(mvb++ PUBLIC
 )
 
 # ============================================================================
+# MAS -> FEM mesh (gmsh + MMG), ABT #1588
+# ============================================================================
+option(MVBPP_BUILD_MESH "Build mvbpp_mesh (gmsh + MMG mesher)" ON)
+if(MVBPP_BUILD_MESH)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/MvbMesh.cmake)
+endif()
+
+# ============================================================================
 # Tests
 # ============================================================================
 enable_testing()
@@ -301,14 +322,33 @@ add_executable(mvb_tests
     tests/test_step_comparison.cpp
     tests/test_integration.cpp
     tests/test_json_integration.cpp
+    tests/test_core_coating.cpp
     tests/test_symmetry.cpp
     tests/test_mas_battery.cpp
     tests/test_toroidal_topview.cpp
     tests/test_toroidal_single_turn_centered.cpp
     tests/test_oblong_planar_turn.cpp
     tests/test_real_winding.cpp
+    tests/test_terminal_lead_lengths.cpp
+    tests/test_toroid_mounting.cpp
     tests/test_section_projection.cpp
+    tests/test_spacers.cpp
+    tests/test_pins.cpp
+    tests/test_pinrail.cpp
+    tests/test_shunts.cpp
+    tests/test_named_roles.cpp
+    tests/test_conducting_default.cpp
+    tests/test_enamel_gate_verdict.cpp
+    tests/test_toroid_base.cpp
+    tests/test_step_roundtrip.cpp
+    tests/test_sleeves.cpp
+    tests/test_slab_cores.cpp
+    tests/test_bobbin_corner.cpp
 )
+if(MVBPP_BUILD_MESH)
+    target_sources(mvb_tests PRIVATE tests/test_mesh_io.cpp)
+    target_link_libraries(mvb_tests PRIVATE mvbpp_mesh)
+endif()
 
 target_compile_definitions(mvb_tests PRIVATE
     REFERENCE_STEPS_DIR="${CMAKE_CURRENT_SOURCE_DIR}/tests/reference_steps"
@@ -332,6 +372,19 @@ target_link_libraries(mvbpp_dump_turns PRIVATE mvb++)
 
 add_executable(mvbpp_section tools/mvbpp_section.cpp)
 target_link_libraries(mvbpp_section PRIVATE mvb++)
+
+add_executable(mvbpp_fitprobe tools/mvbpp_fitprobe.cpp)
+target_link_libraries(mvbpp_fitprobe PRIVATE mvb++)
+
+# ABT #970 step 1: the foil meshing spike (bands only, no primitive in the product path).
+add_executable(mvbpp_foilspike tools/mvbpp_foilspike.cpp)
+target_link_libraries(mvbpp_foilspike PRIVATE mvb++)
+
+add_executable(mvbpp_pathprobe tools/mvbpp_pathprobe.cpp)
+target_link_libraries(mvbpp_pathprobe PRIVATE mvb++)
+
+add_executable(mvbpp_paint2d tools/mvbpp_paint2d.cpp)
+target_link_libraries(mvbpp_paint2d PRIVATE mvb++)
 
 add_executable(mvbpp_generate_bobbins tools/generate_mvbpp_bobbins.cpp)
 target_link_libraries(mvbpp_generate_bobbins PRIVATE occt)

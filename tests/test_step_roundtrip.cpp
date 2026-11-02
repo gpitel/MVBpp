@@ -1,0 +1,375 @@
+// ABT #1265 [stepvalidity]: THE REAL TEST behind the self-intersection gate.
+//
+// The assembler used to run BOPAlgo_ArgumentAnalyzer on every welded conductor of every build.
+// That check is a PROXY. The defect it stands for is this one, measured on 06_llc in August:
+// a fused solid that BRepCheck calls VALID in memory, and that comes back INVALID once a STEP
+// round-trip reconstructs it ('Primary parallel 0 [solid 25]', 3.652 mm^3 -- valid pre-scale,
+// valid post-scale, invalid on read-back; no writer setting changes it, and ShapeFix and
+// UnifySameDomain only "repair" it by deleting copper, 3.652 -> 3.633/3.536 mm^3).
+//
+// Paying the proxy on every build cost more than everything else in the assembler put together:
+// 1094 s of 02_flyback's 1632 s at --segments 12, 590 s of it on a single conductor. So the
+// per-accumulation proxy was dropped and the real condition is asserted HERE, once, where a
+// regression is supposed to be caught: build the geometry, write the STEP, READ IT BACK, and
+// require every solid to be valid and the copper to survive. (ABT #1403 replaced the opt-in
+// MVB_WELD_SELFINT_GATE with a gate that runs ONCE per finished conductor and throws --
+// requireSoundCopper in WireAssembler.)
+//
+// Reading back is the whole point: importSTEP goes through the same STEPCAFControl reader a
+// consumer uses, so a solid that only "works" while it is still in the builder's memory fails
+// here exactly as it would fail in Ansys or gmsh.
+//
+// Tags: [stepvalidity] everywhere, plus [slow] on the designs that take minutes. The default
+// run covers the cheap designs; `./mvb_tests "[stepvalidity]"` from the repo ROOT runs them all.
+#include <catch2/catch_test_macros.hpp>
+
+#include "mvb/MagneticBuilder.h"
+#include "mvb/StepExporter.h"
+#include "mvb/Utils.h"
+
+#include "constructive_models/Magnetic.h"
+
+#include <BRep_Tool.hxx>
+#include <sstream>
+#include <BRepAdaptor_Curve.hxx>
+#include <BOPAlgo_ArgumentAnalyzer.hxx>
+#include <TopExp.hxx>
+#include <TopTools_IndexedDataMapOfShapeListOfShape.hxx>
+#include <TopoDS_Edge.hxx>
+#include <cstdlib>
+#include <BRepCheck_Analyzer.hxx>
+#include <BRepGProp.hxx>
+#include <BRepBndLib.hxx>
+#include <BRepPrimAPI_MakeBox.hxx>
+#include <Bnd_Box.hxx>
+#include <Interface_Static.hxx>
+#include <STEPControl_Controller.hxx>
+#include <GProp_GProps.hxx>
+#include <TopExp_Explorer.hxx>
+#include <TopoDS.hxx>
+#include <TopAbs_ShapeEnum.hxx>
+#include <nlohmann/json.hpp>
+
+#include <algorithm>
+#include <array>
+#include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <string>
+#include <utility>
+#include <vector>
+
+using json = nlohmann::json;
+
+namespace {
+
+json loadDesign(const std::string& name) {
+    // Same search order as the other suites: the MAS examples the build pinned, then the
+    // locally-patched complete fixtures.
+    std::ifstream f(std::string(MAS_EXAMPLES_DIR) + "/" + name);
+    if (!f.good()) f = std::ifstream(std::string(MAS_COMPLETE_DIR) + "/" + name);
+    if (!f.good()) f = std::ifstream("tests/mas_complete_fixtures/" + name);
+    if (!f.good()) f = std::ifstream("tests/realwinding_fixtures/" + name);
+    REQUIRE(f.good());
+    json j = json::parse(f);
+    return j.contains("magnetic") ? j.at("magnetic") : j;
+}
+
+// Volume with ADAPTIVE integration, plus the accuracy the integrator reports. The default
+// VolumeProperties integrates an analytic face exactly and a B-spline face by fixed-order
+// quadrature, so a plain comparison across the round trip measures the INTEGRATION SCHEME and
+// not the geometry -- this test's first run "failed" the CMC at ratio 1.0065 with every solid
+// valid on both sides, which is exactly that artefact (the export re-expresses periodic faces
+// as B-splines, by design). StepExporter.cpp:158 settled the same question the same way.
+std::pair<double, double> totalVolume(const std::vector<mvb::NamedShape>& shapes) {
+    const double eps = 1e-7;
+    double v = 0.0, err = 0.0;
+    for (const auto& ns : shapes) {
+        if (ns.shape.IsNull()) continue;
+        for (TopExp_Explorer e(ns.shape, TopAbs_SOLID); e.More(); e.Next()) {
+            GProp_GProps g;
+            const double relErr = std::abs(BRepGProp::VolumeProperties(e.Current(), g, eps));
+            v += g.Mass();
+            err += relErr * std::abs(g.Mass());
+        }
+    }
+    return {v, err};
+}
+
+// The B-Rep's own resolution: every face is located only to within its tolerance, so a volume
+// is defined only to about tolerance x surface area.
+double brepNoise(const std::vector<mvb::NamedShape>& shapes) {
+    double faceTol = 0.0, area = 0.0;
+    for (const auto& ns : shapes) {
+        if (ns.shape.IsNull()) continue;
+        GProp_GProps sp;
+        BRepGProp::SurfaceProperties(ns.shape, sp);
+        area += std::abs(sp.Mass());
+        for (TopExp_Explorer fx(ns.shape, TopAbs_FACE); fx.More(); fx.Next())
+            faceTol = std::max(faceTol, BRep_Tool::Tolerance(TopoDS::Face(fx.Current())));
+    }
+    return faceTol * area;
+}
+
+std::vector<mvb::NamedShape> buildFemProduct(const std::string& design, int segments) {
+    const json magneticJson = loadDesign(design);
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+
+    mvb::MagneticBuilder builder;
+    return builder.buildAllNamed(enriched,
+                                 /*includeBobbin=*/true,
+                                 /*symmetryPlanes=*/0,
+                                 /*wirePolygonSegments=*/segments,
+                                 /*corePolygonSegments=*/segments,
+                                 /*paintCoating=*/false,          // CD, ABT #1261
+                                 /*emitCoatingShells=*/false,
+                                 /*includeInsulation=*/false,
+                                 /*coreCoatingThickness=*/0.0,
+                                 /*useRealWindingGeometry=*/true,
+                                 /*femReady=*/true);
+}
+
+// ABT #1403: THE TWO PROPERTIES A MESHABLE SOLID NEEDS AND BRepCheck DOES NOT TEST, asserted on
+// every solid of the product: each non-degenerate edge used by exactly two faces (the draw checks
+// this too, and throws), and no self-intersection by BOPAlgo_ArgumentAnalyzer (too expensive for
+// the draw: 8903 s of the two-switch forward's 9071 s, so it lives here). Returns the number of
+// solids checked, and how many of them are conductor copper.
+// copperOnly: check the conductors' solids only (the fixture sweep below -- its question is the
+// copper; the other parts are covered by the round trip).
+std::pair<size_t, size_t> requireSoundSolids(const std::vector<mvb::NamedShape>& built,
+                                             bool copperOnly = false) {
+    size_t solids = 0, copperSolids = 0;
+    for (const auto& ns : built) {
+        if (ns.shape.IsNull()) continue;
+        if (copperOnly && ns.role != mvb::Role::Turn) continue;
+        size_t k = 0;
+        for (TopExp_Explorer e(ns.shape, TopAbs_SOLID); e.More(); e.Next(), ++k) {
+            const TopoDS_Shape& solid = e.Current();
+            ++solids;
+            if (ns.role == mvb::Role::Turn) ++copperSolids;
+            TopTools_IndexedDataMapOfShapeListOfShape edgeFaces;
+            TopExp::MapShapesAndAncestors(solid, TopAbs_EDGE, TopAbs_FACE, edgeFaces);
+            int nonManifold = 0;
+            std::ostringstream where;
+            for (int i = 1; i <= edgeFaces.Extent(); ++i) {
+                const TopoDS_Edge& edge = TopoDS::Edge(edgeFaces.FindKey(i));
+                if (BRep_Tool::Degenerated(edge)) continue;
+                if (edgeFaces(i).Extent() == 2) continue;
+                ++nonManifold;
+                BRepAdaptor_Curve c(edge);
+                const gp_Pnt m = c.Value(0.5 * (c.FirstParameter() + c.LastParameter()));
+                where << " edge used by " << edgeFaces(i).Extent() << " faces at (" << m.X() * 1e3
+                      << ", " << m.Y() * 1e3 << ", " << m.Z() * 1e3 << ") mm;";
+            }
+            BOPAlgo_ArgumentAnalyzer an;
+            an.SetShape1(solid);
+            an.ArgumentTypeMode() = Standard_True;
+            an.SelfInterMode() = Standard_True;
+            an.SmallEdgeMode() = Standard_False;
+            an.SetRunParallel(Standard_True);
+            an.Perform();
+            INFO("solid " << k << " of '" << ns.name << "'" << where.str());
+            CHECK(nonManifold == 0);
+            CHECK_FALSE(an.HasFaulty());
+        }
+    }
+    return {solids, copperSolids};
+}
+
+void requireStepRoundTripValid(const std::string& design,
+                               const std::vector<mvb::NamedShape>& built);
+
+// Build the FEM product for one design, write it, read it back, and hold the round trip to the
+// two things that must survive it: every solid valid, and the copper still there.
+void requireStepRoundTripValid(const std::string& design, int segments) {
+    requireStepRoundTripValid(design, buildFemProduct(design, segments));
+}
+
+void requireStepRoundTripValid(const std::string& design,
+                               const std::vector<mvb::NamedShape>& built) {
+    REQUIRE_FALSE(built.empty());
+    // The conductors manifold and self-intersection-free (ABT #1403). Copper only: this is new
+    // coverage for the copper, and every part -- bobbin included -- is still held to BRepCheck
+    // validity on both sides of the round trip below. (The bobbins' own open flange edges at the
+    // lead slots are a separate finding.)
+    REQUIRE(requireSoundSolids(built, /*copperOnly=*/true).second > 0);
+
+    // In-memory validity FIRST, so a failure says which side of the round trip broke.
+    int inMemorySolids = 0;
+    for (const auto& ns : built) {
+        if (ns.shape.IsNull()) continue;
+        for (TopExp_Explorer e(ns.shape, TopAbs_SOLID); e.More(); e.Next()) {
+            ++inMemorySolids;
+            INFO("in-memory solid of '" << ns.name << "' in " << design);
+            REQUIRE(BRepCheck_Analyzer(e.Current()).IsValid());
+        }
+    }
+    REQUIRE(inMemorySolids > 0);
+
+    std::error_code ec;
+    const auto dir = std::filesystem::temp_directory_path(ec) / "mvb_stepvalidity";
+    std::filesystem::create_directories(dir, ec);
+    const std::string path = (dir / (design + ".step")).string();
+    // The FEM product is written the way the generator writes it: periodic surfaces re-expressed
+    // as B-splines. That conversion is part of what the round trip has to survive.
+    mvb::StepExportOptions opts;
+    opts.nurbsPeriodicSolids = true;
+    REQUIRE(mvb::exportSTEP(built, path, opts));
+
+    const auto readBack = mvb::importSTEP(path);
+    REQUIRE_FALSE(readBack.empty());
+
+    // THE CONDITION THE GATE EXISTED FOR: valid after reconstruction, not merely in memory.
+    int readBackSolids = 0;
+    for (const auto& ns : readBack) {
+        if (ns.shape.IsNull()) continue;
+        for (TopExp_Explorer e(ns.shape, TopAbs_SOLID); e.More(); e.Next()) {
+            ++readBackSolids;
+            INFO("solid of '" << ns.name << "' read back from " << path);
+            REQUIRE(BRepCheck_Analyzer(e.Current()).IsValid());
+        }
+    }
+    REQUIRE(readBackSolids == inMemorySolids);
+
+    // ...and no copper was lost or invented on the way. The file is written in millimetres, so
+    // the metre-frame volume is scaled by 1e9 before the comparison. The bar is the model's own
+    // resolution -- the two integrators' reported accuracies and the B-Rep's face tolerance --
+    // NOT a chosen percentage. The failures this guards against (OCC dropping an operand, a
+    // "repair" that deletes copper) are whole percent, orders of magnitude clear of it.
+    const auto [vInM, errIn] = totalVolume(built);
+    const auto [vOut, errOut] = totalVolume(readBack);
+    REQUIRE(vInM > 0.0);
+    REQUIRE(vOut > 0.0);
+    const double vIn = vInM * 1e9;                       // metres^3 -> mm^3
+    // The floor has THREE contributions, and the measured one dominates: writing the file.
+    // A STEP is text with finite precision, so a re-read shape's points differ from the
+    // in-memory ones in the last digits -- measured at 1.0 ppm on 03_buck (0.0138 of 13591
+    // mm^3) and 1.6 ppm on the CMC (0.0072 of 4621.63 mm^3), with every solid valid on both
+    // sides and the integrator/B-Rep terms an order of magnitude smaller. 10 ppm is therefore
+    // the bar: ten times the noise actually observed, and a THOUSAND times below the smallest
+    // real defect this test exists for (OCC dropping an operand, or a "repair" that deletes
+    // copper, are whole-percent events -- 06_llc's was 3.652 -> 3.536 mm^3, 3.2 %).
+    const double writePrecision = 1e-5 * vIn;
+    const double noise = std::max({errIn * 1e9 + errOut, brepNoise(readBack), writePrecision});
+    INFO(design << ": volume in " << vIn << " mm^3, out " << vOut << " mm^3, difference "
+                << std::abs(vOut - vIn) << " mm^3 against a noise floor of " << noise);
+    REQUIRE(std::abs(vOut - vIn) <= noise);
+}
+
+}   // namespace
+
+TEST_CASE("STEP round trip keeps every solid valid: buck (rect wire)", "[stepvalidity]") {
+    requireStepRoundTripValid("03_buck_inductor_pq3230_n95.json", 0);
+}
+
+TEST_CASE("STEP round trip keeps every solid valid: CMC (toroid)", "[stepvalidity]") {
+    requireStepRoundTripValid("common_mode_choke_complete.json", 0);
+}
+
+// 06_llc_xfmr_eq4128_3c97 is THE design that produced the defect this test replaces: it shipped
+// a BRepCheck-valid solid that read back invalid. It is also minutes long, hence [slow].
+TEST_CASE("STEP round trip keeps every solid valid: 06_llc (the regression case)",
+          "[stepvalidity][slow]") {
+    requireStepRoundTripValid("06_llc_xfmr_eq4128_3c97.json", 0);
+}
+
+// Faceted geometry is the other half of the input class: at --segments 12 the welds run over
+// polygonal faces, which is where BOPAlgo's sporadic self-intersections were seen (ABT #1111).
+TEST_CASE("STEP round trip keeps every solid valid: CMC faceted", "[stepvalidity][slow]") {
+    requireStepRoundTripValid("common_mode_choke_complete.json", 12);
+}
+
+// ABT #1403: THE ISOLATED BUCK-BOOST, FACETED, AS THE CORPUS DRAWS IT (--real --fem --segments 12,
+// MVB_FAN_TERMINALS_ON_PLANE=1, MVB_WELD_ALL=1). Both Primary parallels ended their top wrap with a
+// helix meeting the level run past its station at a 2.23 deg C0 kink; the assembler bridged it and
+// the weld left, on each, a 0.000856 mm^2 sliver face and an edge shared by THREE faces -- a solid
+// BRepCheck calls valid, OMFEM's stepcheck calls CAD DEFECTIVE, and gmsh cannot mesh. This asserts
+// the two properties directly, on EVERY solid of the product (copper, core, bobbin): each
+// non-degenerate edge used by exactly two faces, and BOPAlgo finds no self-intersection. Then the
+// STEP round trip, like every [stepvalidity] case.
+namespace {
+struct ScopedEnv {
+    std::string name;
+    ScopedEnv(const char* n, const char* v) : name(n) { setenv(n, v, 1); }
+    ~ScopedEnv() { unsetenv(name.c_str()); }
+};
+}   // namespace
+
+TEST_CASE("STEP round trip keeps every solid valid: isolated buck-boost (faceted)",
+          "[stepvalidity][abt1403]") {
+    ScopedEnv plane("MVB_FAN_TERMINALS_ON_PLANE", "1");
+    ScopedEnv weld("MVB_WELD_ALL", "1");
+    const std::string design = "realwinding_isolated_buckboost_litz_2p.json";
+    const auto built = buildFemProduct(design, 12);
+    REQUIRE_FALSE(built.empty());
+    const auto [solids, copperSolids] = requireSoundSolids(built);
+    // The filter matched: the product has its copper (two Primary and three Secondary parallels)
+    // and the other parts.
+    REQUIRE(copperSolids >= 4);
+    REQUIRE(solids > copperSolids);
+    requireStepRoundTripValid(design, built);
+}
+
+// ABT #1403: THE REAL-WINDING FIXTURES whose conductors the rect-column corner question concerns,
+// plus the two-switch forward, built as the FEM product (exact geometry), their COPPER held to
+// requireSoundSolids -- self-intersection is not checked in the draw, so it is checked here.
+// (The bobbins of these five designs are non-manifold/self-intersecting on their own, a separate
+// finding outside this test's question.)
+TEST_CASE("Real-winding fixtures: every solid manifold and self-intersection free",
+          "[stepvalidity][slow][abt1403]") {
+    for (const char* design : {"realwinding_rect_U.json", "realwinding_u_order_margin_e16.json",
+                               "realwinding_interleaved_full_section_e16.json",
+                               "realwinding_e16_litz_2layer_leadcollision.json",
+                               "realwinding_two_switch_forward_litz_foil.json"}) {
+        INFO("design " << design);
+        const auto built = buildFemProduct(design, 0);
+        const auto [solids, copperSolids] = requireSoundSolids(built, /*copperOnly=*/true);
+        CHECK(copperSolids > 0);
+        CHECK(solids == copperSolids);
+    }
+}
+
+// OCCT's STEP length unit is one process-wide static, and gmsh's Geometry.OCCTargetUnit "M" sets
+// it on every import without ever resetting it. A STEP written or read afterwards in the same
+// process must come out the same as on a fresh process, and the caller's unit must be left as
+// it was (ABT #1588: the second 2D mesh in one process found a gap corner 1.5 m away).
+TEST_CASE("STEP export and import ignore the unit a previous gmsh import left behind", "[step-unit]") {
+    const TopoDS_Shape box = BRepPrimAPI_MakeBox(gp_Pnt(0.001, 0.002, 0.003), 0.010, 0.020, 0.030).Shape();
+    const std::vector<mvb::NamedShape> shapes{mvb::NamedShape(box, "box")};
+    const std::string path = (std::filesystem::temp_directory_path() / "mvb_step_unit.step").string();
+    // What the file says, read as text: its points and its length unit. A round trip through
+    // importSTEP would cancel a wrong unit (written and read the same wrong way); gmsh reads the
+    // file with its own unit, so the file itself must not change.
+    const auto written = [&]() {
+        REQUIRE(mvb::exportSTEP(shapes, path));
+        std::ifstream f(path);
+        std::vector<std::string> facts;
+        std::string line;
+        while (std::getline(f, line))
+            if (line.find("CARTESIAN_POINT") != std::string::npos || line.find("SI_UNIT") != std::string::npos)
+                facts.push_back(line.substr(line.find('=') + 1));
+        REQUIRE_FALSE(facts.empty());
+        return facts;
+    };
+    const auto readBackX = [&]() {
+        const auto back = mvb::importSTEP(path);
+        REQUIRE(back.size() == 1);
+        Bnd_Box b;
+        BRepBndLib::Add(back.front().shape, b);
+        double x0, y0, z0, x1, y1, z1;
+        b.Get(x0, y0, z0, x1, y1, z1);
+        return x1 - x0;
+    };
+    STEPControl_Controller::Init();
+    const std::string unitBefore = Interface_Static::CVal("xstep.cascade.unit");
+    const auto fresh = written();
+    REQUIRE(std::abs(readBackX() - 10.0) < 1e-6);   // millimetres, as importSTEP promises
+    REQUIRE(Interface_Static::SetCVal("xstep.cascade.unit", "M"));   // what a gmsh import leaves
+    const auto afterGmsh = written();
+    const double xAfterGmsh = readBackX();
+    CHECK(std::string(Interface_Static::CVal("xstep.cascade.unit")) == "M");   // the caller's unit is kept
+    REQUIRE(Interface_Static::SetCVal("xstep.cascade.unit", unitBefore.c_str()));
+    CHECK(afterGmsh == fresh);
+    CHECK(std::abs(xAfterGmsh - 10.0) < 1e-6);
+    std::filesystem::remove(path);
+}
