@@ -404,10 +404,13 @@ async function main() {
 
     test('drawBobbin rounds a rectangular tube with the engine corner radius', () => {
         // OpenMagnetics::Bobbin::get_column_corner_radius, the radius MKF winds the
-        // turns around: with no columnCornerRadius, half the column thickness
-        // (0.45 mm). The flat face on z = 13.3 mm then ends at x = 3.7 - 0.45 mm.
+        // turns around. This record has no columnCornerRadius and no core shape, so MKF
+        // interpolates the bore corner from catalogue formers around a column of the same
+        // shape and carries it out through the wall: 0.9 mm at MKF 5d277ba6. (The old
+        // half-wall default, 0.45 mm, is gone upstream.) The flat face on z = 13.3 mm then
+        // ends at x = 3.7 - 0.9 mm.
         const b = stlBounds(mvbpp.drawBobbin(JSON.stringify(ONE_WINDOW), ...STL));
-        assertClose(flatFaceEnd(b, 0.0037, 0.0133), 0.0037 - 0.00045, 1e-7, 'flat face end');
+        assertClose(flatFaceEnd(b, 0.0037, 0.0133), 0.0037 - 0.0009, 1e-7, 'flat face end');
     });
 
     test('drawBobbin rounds a rectangular tube with the record corner radius', () => {
@@ -415,6 +418,36 @@ async function main() {
         record.processedDescription.columnCornerRadius = 0.0002;
         const b = stlBounds(mvbpp.drawBobbin(JSON.stringify(record), ...STL));
         assertClose(flatFaceEnd(b, 0.0037, 0.0133), 0.0037 - 0.0002, 1e-7, 'flat face end');
+    });
+
+    // A horizontal former as MKF processes it (Ferroxcube CPH-ETD29-1S-13P, 13 pins): the pins
+    // leave along -Z from r1 = 11.33 mm, and each pin row has a rail outboard of its end flange,
+    // across a = 35.2 mm, out to b/2 = 17.6 mm, from r3 = 5 mm below the axis down to r1.
+    // Without the rails the bobbin stops at the flanges: x and z +-10.85 mm, y +-10.54 mm.
+    const ETD29 = fs.readFileSync(path.join(TESTS_DIR, 'etd29_13p_horizontal_bobbin.json'), 'utf8');
+
+    test('drawBobbin builds a horizontal former\'s rails outboard of its end flanges', () => {
+        const b = stlBounds(mvbpp.drawBobbin(ETD29, ...STL));
+        assertClose(b.min[0], -0.0176, 1e-6, 'rail across a: -x');
+        assertClose(b.max[0], 0.0176, 1e-6, 'rail across a: +x');
+        assertClose(b.min[1], -0.0176, 1e-6, 'row 0 rail out to -b/2');
+        assertClose(b.max[1], 0.0176, 1e-6, 'row 1 rail out to +b/2');
+        assertClose(b.min[2], -0.01133, 1e-6, 'rails down to r1');
+    });
+
+    test('drawPins draws a horizontal former\'s pins hanging from its rails', () => {
+        const b = stlBounds(mvbpp.drawPins(ETD29, ...STL));
+        // Outer pins at 6 x 2.54 mm, rows at 12.7 mm, 0.7 mm square, 6.36 mm long.
+        assertClose(b.max[0], 0.01524 + 0.00035, 1e-6, 'outer pin');
+        assertClose(b.min[0], -0.01524 - 0.00035, 1e-6, 'outer pin');
+        assertClose(b.max[1], 0.0127 + 0.00035, 1e-6, 'row 1');
+        assertClose(b.min[1], -0.0127 - 0.00035, 1e-6, 'row 0');
+        assertClose(b.max[2], -0.01133, 1e-6, 'pins leave from r1');
+        assertClose(b.min[2], -0.01133 - 0.00636, 1e-6, 'pin length');
+    });
+
+    test('drawPins returns an empty buffer for a bobbin without pins', () => {
+        assertEqual(mvbpp.drawPins(JSON.stringify(ONE_WINDOW), ...STL).length, 0);
     });
 
     // ── drawTurns ────────────────────────────────────────────────────────────

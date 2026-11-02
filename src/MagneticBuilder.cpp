@@ -1431,7 +1431,11 @@ NamedShape MagneticBuilder::buildBobbinNamedFromBobbin(const MAS::Bobbin& bobbin
     double flangeThickness = pdOpt->get_wall_thickness();
     if (flangeThickness < 0.0 || std::isnan(flangeThickness)) flangeThickness = 0.0;
     std::string name = bobbin.get_name().value_or("Bobbin");
-    TopoDS_Shape s = BobbinBuilder::buildBobbin(*pdOpt, flangeThickness, axisIsY, polygonSegments);
+    // ABT #1249: the rails are part of the bobbin moulding, so a bobbin drawn alone carries them too.
+    // Only a Y-axis former has the flanges MKF's rail frame hangs them from.
+    TopoDS_Shape s = BobbinBuilder::buildBobbin(*pdOpt, flangeThickness, axisIsY, polygonSegments,
+                                                axisIsY ? OpenMagnetics::Bobbin(bobbin).get_pin_rails()
+                                                        : std::vector<OpenMagnetics::Bobbin::PinRailBlock>{});
     // "No bobbin to draw" — e.g. a planar / PCB winding whose column has zero wall
     // and column thickness, so the box body cut (outer minus same-size hole) leaves
     // an empty compound. That is NOT an error: normalise it to a null shape and let

@@ -4,6 +4,7 @@
 #include <TopExp_Explorer.hxx>
 #include <TopAbs_ShapeEnum.hxx>
 #include <TopTools_ListOfShape.hxx>
+#include <map>
 #include <BRepAlgoAPI_Fuse.hxx>
 #include <GProp_GProps.hxx>
 #include <BRepGProp.hxx>
@@ -330,15 +331,17 @@ TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescriptio
     }
 
     if (!pinRails.empty()) {
-        // ABT #1249: fuse MKF's pin rails with the bottom flange (see BobbinBuilder.h).
+        // ABT #1249: fuse MKF's pin rails with the flange each one stands on (see BobbinBuilder.h).
         if (!axisIsY || !hasFlanges || bobbinShape.IsNull())
             throw std::invalid_argument("BobbinBuilder: pin rails need a Y-axis former with flanges to hang from");
         // The bottom flange sits below the lowest chamber, which is not at -height/2 when the
         // chambers are off centre; the rotation to a Y axis carries z to y unchanged.
-        const double flangeFace = zLow - flangeThickness;
+        const double bottomFace = zLow - flangeThickness;
+        const double topFace = zHigh + flangeThickness;
         // The compound is the tube pieces, then the top flange, the bottom flange and the
         // dividers, so a one-window bobbin is still body, top flange, bottom flange.
         const std::size_t expectedSolids = tubeSpans.size() + 2 + gaps.size();
+        const std::size_t topFlange = tubeSpans.size();
         const std::size_t bottomFlange = tubeSpans.size() + 1;
         std::vector<TopoDS_Shape> solids;
         for (TopExp_Explorer exp(bobbinShape, TopAbs_SOLID); exp.More(); exp.Next()) solids.push_back(exp.Current());
@@ -346,33 +349,51 @@ TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescriptio
             throw std::runtime_error("BobbinBuilder: expected " + std::to_string(tubeSpans.size()) +
                                      " tube piece(s), top flange, bottom flange and " + std::to_string(gaps.size()) +
                                      " divider(s), got " + std::to_string(solids.size()) + " solids");
-        TopTools_ListOfShape arguments, tools;
-        arguments.Append(solids[bottomFlange]);
-        for (const auto& rail : pinRails) {
+        // A vertical former's rails hang under the bottom flange, their top on its outer face. A
+        // horizontal former's stand outboard of both end flanges, one row on each (MKF
+        // Bobbin::get_pin_rails), so a rail of the +Y row starts on the top flange's outer face.
+        const auto railShapes = buildPinRailsNamed(pinRails, "rail");
+        std::map<std::size_t, TopTools_ListOfShape> railsByFlange;
+        for (std::size_t i = 0; i < pinRails.size(); ++i) {
+            const auto& rail = pinRails[i];
             const double railTop = rail.centre[1] + rail.halfExtents[1];
-            if (std::abs(railTop - flangeFace) > 1e-9)
-                throw std::invalid_argument("BobbinBuilder: pin rail '" + rail.name + "' tops out at y = " +
-                                            std::to_string(railTop) + " m, not on the drawn bottom flange face y = " +
-                                            std::to_string(flangeFace) + " m");
+            const double railBottom = rail.centre[1] - rail.halfExtents[1];
+            if (std::abs(railTop - bottomFace) <= 1e-9)
+                railsByFlange[bottomFlange].Append(railShapes[i].shape);
+            else if (std::abs(railBottom - topFace) <= 1e-9)
+                railsByFlange[topFlange].Append(railShapes[i].shape);
+            else
+                throw std::invalid_argument("BobbinBuilder: pin rail '" + rail.name + "' spans y = " +
+                                            std::to_string(railBottom) + " to " + std::to_string(railTop) +
+                                            " m, not on the drawn bottom flange face y = " + std::to_string(bottomFace) +
+                                            " m nor outboard of the top flange face y = " + std::to_string(topFace) + " m");
         }
-        for (auto& railShape : buildPinRailsNamed(pinRails, "rail")) tools.Append(railShape.shape);
-        BRepAlgoAPI_Fuse fuse;
-        fuse.SetArguments(arguments);
-        fuse.SetTools(tools);
-        fuse.Build();
-        checkIsDone(fuse, "bottom flange + pin rails");
-        std::size_t fusedSolids = 0;
-        for (TopExp_Explorer exp(fuse.Shape(), TopAbs_SOLID); exp.More(); exp.Next()) ++fusedSolids;
-        if (fusedSolids != 1)
-            throw std::runtime_error("BobbinBuilder: the bottom flange and its " + std::to_string(pinRails.size()) +
-                                     " pin rail block(s) fuse into " + std::to_string(fusedSolids) +
-                                     " solids; a rail that does not touch its flange would float in the model");
-        TopoDS_Shape fusedFlange;
-        for (TopExp_Explorer exp(fuse.Shape(), TopAbs_SOLID); exp.More(); exp.Next()) fusedFlange = exp.Current();
+        for (auto& [flange, tools] : railsByFlange) {
+            const char* which = flange == bottomFlange ? "bottom" : "top";
+            TopTools_ListOfShape arguments;
+            arguments.Append(solids[flange]);
+            BRepAlgoAPI_Fuse fuse;
+            fuse.SetArguments(arguments);
+            fuse.SetTools(tools);
+            fuse.Build();
+            checkIsDone(fuse, flange == bottomFlange ? "bottom flange + pin rails" : "top flange + pin rails");
+            std::size_t fusedSolids = 0;
+            TopoDS_Shape fusedFlange;
+            for (TopExp_Explorer exp(fuse.Shape(), TopAbs_SOLID); exp.More(); exp.Next()) {
+                ++fusedSolids;
+                fusedFlange = exp.Current();
+            }
+            if (fusedSolids != 1)
+                throw std::runtime_error(std::string("BobbinBuilder: the ") + which + " flange and its " +
+                                         std::to_string(tools.Extent()) + " pin rail block(s) fuse into " +
+                                         std::to_string(fusedSolids) +
+                                         " solids; a rail that does not touch its flange would float in the model");
+            solids[flange] = fusedFlange;
+        }
         TopoDS_Compound comp;
         BRep_Builder bld;
         bld.MakeCompound(comp);
-        for (std::size_t i = 0; i < solids.size(); ++i) bld.Add(comp, i == bottomFlange ? fusedFlange : solids[i]);
+        for (const auto& solid : solids) bld.Add(comp, solid);
         bobbinShape = comp;
     }
 

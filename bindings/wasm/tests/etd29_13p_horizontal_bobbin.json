@@ -1,0 +1,356 @@
+{
+  "functionalDescription": {
+    "dimensions": {
+      "a": {
+        "maximum": 0.0352
+      },
+      "b": {
+        "maximum": 0.0352
+      },
+      "b1": {
+        "nominal": 0.007
+      },
+      "d1": {
+        "maximum": 0.0218,
+        "minimum": 0.0216
+      },
+      "d2": {
+        "maximum": 0.0118,
+        "minimum": 0.01155
+      },
+      "d3": {
+        "maximum": 0.0103,
+        "minimum": 0.01
+      },
+      "h1": {
+        "maximum": 0.0212,
+        "minimum": 0.02095
+      },
+      "h2": {
+        "minimum": 0.0194
+      },
+      "r1": {
+        "nominal": 0.01133
+      },
+      "r2": {
+        "nominal": 0.01429
+      },
+      "r3": {
+        "nominal": 0.005
+      }
+    },
+    "family": "etd",
+    "material": "PBT",
+    "orientation": "horizontal",
+    "pinout": {
+      "centralPitch": 0.01016,
+      "numberPins": 13,
+      "numberPinsPerRow": [
+        7,
+        6
+      ],
+      "numberRows": 2,
+      "pinDescription": {
+        "dimensions": [
+          0.0007,
+          0.0007,
+          0.00636
+        ],
+        "shape": "rectangular",
+        "type": "tht"
+      },
+      "pitch": 0.00508,
+      "rowDistance": 0.0254
+    },
+    "shape": "ETD 29/16/10",
+    "type": "standard"
+  },
+  "name": "CPH-ETD29-1S-13P",
+  "processedDescription": {
+    "columnDepth": 0.0058375,
+    "columnShape": "round",
+    "columnThickness": 0.0007625000000000002,
+    "columnWidth": 0.0058375,
+    "coordinates": [
+      0,
+      0,
+      0
+    ],
+    "pins": [
+      {
+        "coordinates": [
+          -0.01524,
+          -0.0127,
+          -0.01451
+        ],
+        "dimensions": [
+          0.0007,
+          0.0007,
+          0.00636
+        ],
+        "name": "1",
+        "rotation": [
+          90,
+          0,
+          0
+        ],
+        "shape": "rectangular",
+        "type": "tht"
+      },
+      {
+        "coordinates": [
+          -0.01016,
+          -0.0127,
+          -0.01451
+        ],
+        "dimensions": [
+          0.0007,
+          0.0007,
+          0.00636
+        ],
+        "name": "2",
+        "rotation": [
+          90,
+          0,
+          0
+        ],
+        "shape": "rectangular",
+        "type": "tht"
+      },
+      {
+        "coordinates": [
+          -0.00508,
+          -0.0127,
+          -0.01451
+        ],
+        "dimensions": [
+          0.0007,
+          0.0007,
+          0.00636
+        ],
+        "name": "3",
+        "rotation": [
+          90,
+          0,
+          0
+        ],
+        "shape": "rectangular",
+        "type": "tht"
+      },
+      {
+        "coordinates": [
+          0,
+          -0.0127,
+          -0.01451
+        ],
+        "dimensions": [
+          0.0007,
+          0.0007,
+          0.00636
+        ],
+        "name": "4",
+        "rotation": [
+          90,
+          0,
+          0
+        ],
+        "shape": "rectangular",
+        "type": "tht"
+      },
+      {
+        "coordinates": [
+          0.00508,
+          -0.0127,
+          -0.01451
+        ],
+        "dimensions": [
+          0.0007,
+          0.0007,
+          0.00636
+        ],
+        "name": "5",
+        "rotation": [
+          90,
+          0,
+          0
+        ],
+        "shape": "rectangular",
+        "type": "tht"
+      },
+      {
+        "coordinates": [
+          0.01016,
+          -0.0127,
+          -0.01451
+        ],
+        "dimensions": [
+          0.0007,
+          0.0007,
+          0.00636
+        ],
+        "name": "6",
+        "rotation": [
+          90,
+          0,
+          0
+        ],
+        "shape": "rectangular",
+        "type": "tht"
+      },
+      {
+        "coordinates": [
+          0.01524,
+          -0.0127,
+          -0.01451
+        ],
+        "dimensions": [
+          0.0007,
+          0.0007,
+          0.00636
+        ],
+        "name": "7",
+        "rotation": [
+          90,
+          0,
+          0
+        ],
+        "shape": "rectangular",
+        "type": "tht"
+      },
+      {
+        "coordinates": [
+          0.01524,
+          0.0127,
+          -0.01451
+        ],
+        "dimensions": [
+          0.0007,
+          0.0007,
+          0.00636
+        ],
+        "name": "8",
+        "rotation": [
+          90,
+          0,
+          0
+        ],
+        "shape": "rectangular",
+        "type": "tht"
+      },
+      {
+        "coordinates": [
+          0.01016,
+          0.0127,
+          -0.01451
+        ],
+        "dimensions": [
+          0.0007,
+          0.0007,
+          0.00636
+        ],
+        "name": "9",
+        "rotation": [
+          90,
+          0,
+          0
+        ],
+        "shape": "rectangular",
+        "type": "tht"
+      },
+      {
+        "coordinates": [
+          0.00508,
+          0.0127,
+          -0.01451
+        ],
+        "dimensions": [
+          0.0007,
+          0.0007,
+          0.00636
+        ],
+        "name": "10",
+        "rotation": [
+          90,
+          0,
+          0
+        ],
+        "shape": "rectangular",
+        "type": "tht"
+      },
+      {
+        "coordinates": [
+          -0.00508,
+          0.0127,
+          -0.01451
+        ],
+        "dimensions": [
+          0.0007,
+          0.0007,
+          0.00636
+        ],
+        "name": "11",
+        "rotation": [
+          90,
+          0,
+          0
+        ],
+        "shape": "rectangular",
+        "type": "tht"
+      },
+      {
+        "coordinates": [
+          -0.01016,
+          0.0127,
+          -0.01451
+        ],
+        "dimensions": [
+          0.0007,
+          0.0007,
+          0.00636
+        ],
+        "name": "12",
+        "rotation": [
+          90,
+          0,
+          0
+        ],
+        "shape": "rectangular",
+        "type": "tht"
+      },
+      {
+        "coordinates": [
+          -0.01524,
+          0.0127,
+          -0.01451
+        ],
+        "dimensions": [
+          0.0007,
+          0.0007,
+          0.00636
+        ],
+        "name": "13",
+        "rotation": [
+          90,
+          0,
+          0
+        ],
+        "shape": "rectangular",
+        "type": "tht"
+      }
+    ],
+    "wallThickness": 0.0008374999999999997,
+    "windingWindows": [
+      {
+        "area": 9.724250000000001e-05,
+        "coordinates": [
+          0.00834375,
+          0
+        ],
+        "height": 0.0194,
+        "sectionsAlignment": "centered",
+        "sectionsOrientation": "overlapping",
+        "width": 0.0050125000000000005
+      }
+    ]
+  }
+}

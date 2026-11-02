@@ -13,6 +13,7 @@
 #include "mvb/SpacerBuilder.h"
 #include "mvb/FR4Builder.h"
 #include "mvb/BobbinBuilder.h"
+#include "mvb/PinBuilder.h"
 #include "mvb/TurnBuilder.h"
 #include "mvb/Utils.h"
 #include "mvb/mesh/Mesher.h"
@@ -814,6 +815,28 @@ std::string _drawBobbinToPath(const std::string& json_str,
     return path;
 }
 
+// drawPins: the bobbin's solder pins alone (PinBuilder), so a caller can colour them apart from
+// the plastic. Same arguments as drawBobbin. A bobbin without processedDescription.pins has
+// nothing to draw and returns an empty buffer, as drawBobbin does for no bobbin.
+val _drawPins(const std::string& json_str,
+              const std::string& mode,
+              const std::string& plane,
+              double offset,
+              const std::string& format,
+              double scale,
+              int polygonSegments,
+              const std::string& symmetry,
+              const std::string& side) {
+    (void)polygonSegments;   // pins are boxes or MKF-sized cylinders; kept for drawBobbin's arity
+    auto bobbin = json::parse(json_str).get<MAS::Bobbin>();
+    const auto processed = bobbin.get_processed_description();
+    if (!processed) throw std::runtime_error("drawPins: bobbin.processedDescription is required");
+    auto named = mvb::PinBuilder::buildPinsNamed(*processed, bobbin.get_name().value_or("Bobbin"));
+    if (named.empty()) return makeUint8Array(std::string());
+    auto data = deliver(std::move(named), mode, plane, offset, format, scale, symmetry, side);
+    return makeUint8Array(data);
+}
+
 // drawTurns
 // Measurement/inspection handles for the viewer (see g_skipGeometryChecks above).
 void _setSkipChecks(bool on) { g_skipGeometryChecks = on; }
@@ -1128,6 +1151,7 @@ EMSCRIPTEN_BINDINGS(mvbpp) {
     function("drawCorePieceToPath", &guard<&_drawCorePieceToPath>::call);
     function("drawBobbin",          &guard<&_drawBobbin>::call);
     function("drawBobbinToPath",    &guard<&_drawBobbinToPath>::call);
+    function("drawPins",            &guard<&_drawPins>::call);
     function("mvbppSetSkipChecks",  &_setSkipChecks);
     function("mvbppSetWeldMode",    &guard<&_setWeldMode>::call);
     function("mvbppSetLeadCorners", &guard<&_setLeadCorners>::call);
