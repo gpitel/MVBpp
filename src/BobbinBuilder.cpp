@@ -4,6 +4,7 @@
 #include <TopExp_Explorer.hxx>
 #include <TopAbs_ShapeEnum.hxx>
 #include <TopTools_ListOfShape.hxx>
+#include <map>
 #include <BRepAlgoAPI_Fuse.hxx>
 #include <GProp_GProps.hxx>
 #include <BRepGProp.hxx>
@@ -130,20 +131,51 @@ TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescriptio
     }
 
     const auto& wwList = bobbin.get_winding_windows();
+    // A chambered bobbin (EP, a split bobbin) has one winding window per chamber.
+    // This used to read window 0 only and centre the tube on zero, so a
+    // two-chamber bobbin came out one chamber long: the app and every drawing
+    // showed a part about half its real length. Now the tube spans every window
+    // at its own axial coordinate, with a divider in each gap between chambers.
+    struct Chamber { double bottom; double top; };
+    std::vector<Chamber> chambers;
     double wwWidth = 0.0;
-    double wwHeight = 0.0;
-    double wwDepth = 0.0;
-    if (!wwList.empty()) {
-        wwWidth = wwList[0].get_width().value_or(0.0);
-        wwHeight = wwList[0].get_height().value_or(0.0);
-        wwDepth = wwList[0].get_radial_height().value_or(wwWidth);
+    for (const auto& ww : wwList) {
+        double h = ww.get_height().value_or(0.0);
+        if (h <= 0.0) continue;
+        double centre = 0.0;
+        if (ww.get_coordinates() && ww.get_coordinates()->size() > 1) centre = (*ww.get_coordinates())[1];
+        chambers.push_back({centre - h / 2.0, centre + h / 2.0});
+        wwWidth = std::max(wwWidth, ww.get_width().value_or(0.0));
     }
+    if (chambers.empty()) chambers.push_back({-colDepth / 2.0, colDepth / 2.0});
     if (wwWidth <= 0.0) wwWidth = colWidth;
-    if (wwHeight <= 0.0) wwHeight = colDepth;
-    if (wwDepth <= 0.0) wwDepth = wwWidth;
+    std::sort(chambers.begin(), chambers.end(), [](const Chamber& a, const Chamber& b) { return a.bottom < b.bottom; });
 
-    double height = wwHeight;
+    const double zLow = chambers.front().bottom;
+    double zHigh = chambers.front().top;
+    // Gaps between consecutive chambers: each gets a divider as thick as the gap.
+    std::vector<Chamber> gaps;
+    for (size_t i = 1; i < chambers.size(); ++i) {
+        if (chambers[i].bottom - zHigh > 1e-9) gaps.push_back({zHigh, chambers[i].bottom});
+        zHigh = std::max(zHigh, chambers[i].top);
+    }
+    const double height = zHigh - zLow;
     if (height <= 0.0) return TopoDS_Shape();
+
+    // The tube is built in pieces that stop at the dividers, and every plate (an
+    // end flange or a divider) is cut at the bore. A moulded bobbin is one part: a
+    // tube running through a divider leaves its edges inside the divider, and a
+    // drawing shows them as false hidden lines. Without flanges no divider is
+    // built either, so the tube stays in one piece.
+    std::vector<Chamber> tubeSpans;
+    double spanBottom = zLow;
+    if (hasFlanges) {
+        for (const auto& g : gaps) {
+            tubeSpans.push_back({spanBottom, g.bottom});
+            spanBottom = g.top;
+        }
+    }
+    tubeSpans.push_back({spanBottom, zHigh});
 
     TopoDS_Shape bobbinShape;
 
@@ -152,63 +184,55 @@ TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescriptio
         double innerR = colWidth - bobbin.get_column_thickness();
         if (innerR <= 0.0) innerR = outerR - wallThickness;
 
-        // Build the cylinder along +Z then translate down by height/2 so it
-        // straddles z=0 (matches the legacy MakeCylinder placement).
+        // Build the cylinder along +Z, then translate it to its axial position.
         auto make_cyl = [&](double radius, double h, double zBottom,
                             bool circumscribed = false) -> TopoDS_Shape {
             TopoDS_Shape c = build_polygon_cylinder(h, radius, polygonSegments, circumscribed);
             return translate_shape(c, 0.0, 0.0, zBottom);
         };
 
-        TopoDS_Shape outerCyl = make_cyl(outerR, height, -height / 2.0);
-
-        TopoDS_Shape body;
-        if (innerR + 1e-9 >= outerR) {
-            body = outerCyl;
-        } else {
-            double innerHeight = height * 1.1;
+        auto make_tube = [&](const Chamber& span) -> TopoDS_Shape {
+            double h = span.top - span.bottom;
+            TopoDS_Shape outerCyl = make_cyl(outerR, h, span.bottom);
+            if (innerR + 1e-9 >= outerR) return outerCyl;
+            double innerHeight = h * 1.1;
             // The bore faces the core column: circumscribe so faceting never bites in.
-            TopoDS_Shape innerCyl =
-                make_cyl(innerR, innerHeight, -innerHeight / 2.0, /*circumscribed=*/true);
+            TopoDS_Shape innerCyl = make_cyl(innerR, innerHeight, span.bottom - (innerHeight - h) / 2.0,
+                                             /*circumscribed=*/true);
             BRepAlgoAPI_Cut cutOp(outerCyl, innerCyl);
             checkIsDone(cutOp, "round body hollow");
-            body = cutOp.Shape();
-        }
+            return cutOp.Shape();
+        };
 
         if (hasFlanges) {
             double flangeOuterR = outerR + wwWidth;
-            double holeHeight = flangeThickness * 1.2;
-            double holeMargin = (holeHeight - flangeThickness) / 2.0;
+            auto make_flange = [&](double zBottom, double thickness, const char* ctx) -> TopoDS_Shape {
+                double holeHeight = thickness * 1.2;
+                double holeMargin = (holeHeight - thickness) / 2.0;
+                TopoDS_Shape disc = make_cyl(flangeOuterR, thickness, zBottom);
+                // Flange holes face the core column: circumscribe so faceting never bites in
+                // (measured on EP 13: inscribed chords cut 0.42 mm^3 into the EXACT column).
+                TopoDS_Shape hole = make_cyl(innerR, holeHeight, zBottom - holeMargin,
+                                             /*circumscribed=*/true);
+                BRepAlgoAPI_Cut cut(disc, hole);
+                checkIsDone(cut, ctx);
+                return cut.Shape();
+            };
 
-            TopoDS_Shape topFlangeDisc = make_cyl(flangeOuterR, flangeThickness, height / 2.0);
-            // Flange holes face the core column: circumscribe so faceting never bites in
-            // (measured on EP 13: inscribed chords cut 0.42 mm^3 into the EXACT column).
-            TopoDS_Shape topHole = make_cyl(innerR, holeHeight, height / 2.0 - holeMargin,
-                                            /*circumscribed=*/true);
-            BRepAlgoAPI_Cut topCut(topFlangeDisc, topHole);
-            checkIsDone(topCut, "round top flange");
-
-            TopoDS_Shape bottomFlangeDisc = make_cyl(flangeOuterR, flangeThickness,
-                                                     -(height / 2.0 + flangeThickness));
-            TopoDS_Shape bottomHole = make_cyl(innerR, holeHeight,
-                                               -(height / 2.0 + flangeThickness) - holeMargin,
-                                               /*circumscribed=*/true);
-            BRepAlgoAPI_Cut bottomCut(bottomFlangeDisc, bottomHole);
-            checkIsDone(bottomCut, "round bottom flange");
-
-            // Skip the Fuse: return body + flanges as a compound of 3 solids.
+            // Skip the Fuse: return tube pieces, flanges and dividers as one compound.
             // Downstream cut_bobbin can then AABB-prefilter tools per solid;
             // most turns sit in the winding window and don't intersect the
             // flange AABBs, so per-solid cuts run against far fewer tools.
             TopoDS_Compound comp;
             BRep_Builder bld;
             bld.MakeCompound(comp);
-            bld.Add(comp, body);
-            bld.Add(comp, topCut.Shape());
-            bld.Add(comp, bottomCut.Shape());
+            for (const auto& span : tubeSpans) bld.Add(comp, make_tube(span));
+            bld.Add(comp, make_flange(zHigh, flangeThickness, "round top flange"));
+            bld.Add(comp, make_flange(zLow - flangeThickness, flangeThickness, "round bottom flange"));
+            for (const auto& g : gaps) bld.Add(comp, make_flange(g.bottom, g.top - g.bottom, "round divider"));
             bobbinShape = comp;
         } else {
-            bobbinShape = body;
+            bobbinShape = make_tube(tubeSpans.front());
         }
     } else {
         // Rectangular (or irregular = EFD) column.
@@ -260,37 +284,43 @@ TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescriptio
         }
         const double rInner = oblong ? 0.5 * std::min(holeWidth, holeDepth) : 0.0;
 
-        TopoDS_Shape outer = makeRoundedRectPrism(outerWidth, outerDepth, height, rOuter, -height / 2.0);
-        TopoDS_Shape central = makeRoundedRectPrism(holeWidth, holeDepth, height + 2.0 * eps, rInner, -height / 2.0 - eps);
-        BRepAlgoAPI_Cut bodyCut(outer, central);
-        checkIsDone(bodyCut, "rect body hollow");
+        auto make_tube = [&](const Chamber& span) -> TopoDS_Shape {
+            double h = span.top - span.bottom;
+            TopoDS_Shape outer = makeRoundedRectPrism(outerWidth, outerDepth, h, rOuter, span.bottom);
+            TopoDS_Shape central = makeRoundedRectPrism(holeWidth, holeDepth, h + 2.0 * eps, rInner, span.bottom - eps);
+            BRepAlgoAPI_Cut cut(outer, central);
+            checkIsDone(cut, "rect body hollow");
+            return cut.Shape();
+        };
 
         if (hasFlanges) {
             double flangeWidth = 2.0 * (colWidth + wwWidth);
             double flangeDepth = 2.0 * (colDepth + wwWidth);
-            double holeEps = flangeThickness * 0.1;
+            // The engine has no flange corner radius. A rectangular flange keeps a
+            // quarter of its smaller side: catalogue drawings of E bobbins show
+            // rounded flanges, with no radius given.
             const double rFlange = roundCorners ? 0.25 * std::min(flangeWidth, flangeDepth) : 0.0;
 
-            TopoDS_Shape topFlange = makeRoundedRectPrism(flangeWidth, flangeDepth, flangeThickness, rFlange, height / 2.0);
-            TopoDS_Shape topHole = makeRoundedRectPrism(holeWidth, holeDepth, flangeThickness + 2.0 * holeEps, rInner, height / 2.0 - holeEps);
-            BRepAlgoAPI_Cut topCut(topFlange, topHole);
-            checkIsDone(topCut, "rect top flange");
+            auto make_flange = [&](double zBottom, double thickness, const char* ctx) -> TopoDS_Shape {
+                double holeEps = thickness * 0.1;
+                TopoDS_Shape plate = makeRoundedRectPrism(flangeWidth, flangeDepth, thickness, rFlange, zBottom);
+                TopoDS_Shape hole = makeRoundedRectPrism(holeWidth, holeDepth, thickness + 2.0 * holeEps, rInner, zBottom - holeEps);
+                BRepAlgoAPI_Cut cut(plate, hole);
+                checkIsDone(cut, ctx);
+                return cut.Shape();
+            };
 
-            TopoDS_Shape bottomFlange = makeRoundedRectPrism(flangeWidth, flangeDepth, flangeThickness, rFlange, -(height / 2.0 + flangeThickness));
-            TopoDS_Shape bottomHole = makeRoundedRectPrism(holeWidth, holeDepth, flangeThickness + 2.0 * holeEps, rInner, -(height / 2.0 + flangeThickness) - holeEps);
-            BRepAlgoAPI_Cut bottomCut(bottomFlange, bottomHole);
-            checkIsDone(bottomCut, "rect bottom flange");
-
-            // Skip the Fuse: compound body + flanges as 3 solids (see round path).
+            // Skip the Fuse: compound of tube pieces, flanges and dividers (see round path).
             TopoDS_Compound comp;
             BRep_Builder bld;
             bld.MakeCompound(comp);
-            bld.Add(comp, bodyCut.Shape());
-            bld.Add(comp, topCut.Shape());
-            bld.Add(comp, bottomCut.Shape());
+            for (const auto& span : tubeSpans) bld.Add(comp, make_tube(span));
+            bld.Add(comp, make_flange(zHigh, flangeThickness, "rect top flange"));
+            bld.Add(comp, make_flange(zLow - flangeThickness, flangeThickness, "rect bottom flange"));
+            for (const auto& g : gaps) bld.Add(comp, make_flange(g.bottom, g.top - g.bottom, "rect divider"));
             bobbinShape = comp;
         } else {
-            bobbinShape = bodyCut.Shape();
+            bobbinShape = make_tube(tubeSpans.front());
         }
     }
 
@@ -301,44 +331,69 @@ TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescriptio
     }
 
     if (!pinRails.empty()) {
-        // ABT #1249: fuse MKF's pin rails with the bottom flange (see BobbinBuilder.h).
+        // ABT #1249: fuse MKF's pin rails with the flange each one stands on (see BobbinBuilder.h).
         if (!axisIsY || !hasFlanges || bobbinShape.IsNull())
             throw std::invalid_argument("BobbinBuilder: pin rails need a Y-axis former with flanges to hang from");
-        const double flangeFace = -(height / 2.0 + flangeThickness);
+        // The bottom flange sits below the lowest chamber, which is not at -height/2 when the
+        // chambers are off centre; the rotation to a Y axis carries z to y unchanged.
+        const double bottomFace = zLow - flangeThickness;
+        const double topFace = zHigh + flangeThickness;
+        // The compound is the tube pieces, then the top flange, the bottom flange and the
+        // dividers, so a one-window bobbin is still body, top flange, bottom flange.
+        const std::size_t expectedSolids = tubeSpans.size() + 2 + gaps.size();
+        const std::size_t topFlange = tubeSpans.size();
+        const std::size_t bottomFlange = tubeSpans.size() + 1;
         std::vector<TopoDS_Shape> solids;
         for (TopExp_Explorer exp(bobbinShape, TopAbs_SOLID); exp.More(); exp.Next()) solids.push_back(exp.Current());
-        if (solids.size() != 3)
-            throw std::runtime_error("BobbinBuilder: expected body, top flange and bottom flange, got " +
-                                     std::to_string(solids.size()) + " solids");
-        TopTools_ListOfShape arguments, tools;
-        arguments.Append(solids[2]);
-        for (const auto& rail : pinRails) {
+        if (solids.size() != expectedSolids)
+            throw std::runtime_error("BobbinBuilder: expected " + std::to_string(tubeSpans.size()) +
+                                     " tube piece(s), top flange, bottom flange and " + std::to_string(gaps.size()) +
+                                     " divider(s), got " + std::to_string(solids.size()) + " solids");
+        // A vertical former's rails hang under the bottom flange, their top on its outer face. A
+        // horizontal former's stand outboard of both end flanges, one row on each (MKF
+        // Bobbin::get_pin_rails), so a rail of the +Y row starts on the top flange's outer face.
+        const auto railShapes = buildPinRailsNamed(pinRails, "rail");
+        std::map<std::size_t, TopTools_ListOfShape> railsByFlange;
+        for (std::size_t i = 0; i < pinRails.size(); ++i) {
+            const auto& rail = pinRails[i];
             const double railTop = rail.centre[1] + rail.halfExtents[1];
-            if (std::abs(railTop - flangeFace) > 1e-9)
-                throw std::invalid_argument("BobbinBuilder: pin rail '" + rail.name + "' tops out at y = " +
-                                            std::to_string(railTop) + " m, not on the drawn bottom flange face y = " +
-                                            std::to_string(flangeFace) + " m");
+            const double railBottom = rail.centre[1] - rail.halfExtents[1];
+            if (std::abs(railTop - bottomFace) <= 1e-9)
+                railsByFlange[bottomFlange].Append(railShapes[i].shape);
+            else if (std::abs(railBottom - topFace) <= 1e-9)
+                railsByFlange[topFlange].Append(railShapes[i].shape);
+            else
+                throw std::invalid_argument("BobbinBuilder: pin rail '" + rail.name + "' spans y = " +
+                                            std::to_string(railBottom) + " to " + std::to_string(railTop) +
+                                            " m, not on the drawn bottom flange face y = " + std::to_string(bottomFace) +
+                                            " m nor outboard of the top flange face y = " + std::to_string(topFace) + " m");
         }
-        for (auto& railShape : buildPinRailsNamed(pinRails, "rail")) tools.Append(railShape.shape);
-        BRepAlgoAPI_Fuse fuse;
-        fuse.SetArguments(arguments);
-        fuse.SetTools(tools);
-        fuse.Build();
-        checkIsDone(fuse, "bottom flange + pin rails");
-        std::size_t fusedSolids = 0;
-        for (TopExp_Explorer exp(fuse.Shape(), TopAbs_SOLID); exp.More(); exp.Next()) ++fusedSolids;
-        if (fusedSolids != 1)
-            throw std::runtime_error("BobbinBuilder: the bottom flange and its " + std::to_string(pinRails.size()) +
-                                     " pin rail block(s) fuse into " + std::to_string(fusedSolids) +
-                                     " solids; a rail that does not touch its flange would float in the model");
-        TopoDS_Shape fusedFlange;
-        for (TopExp_Explorer exp(fuse.Shape(), TopAbs_SOLID); exp.More(); exp.Next()) fusedFlange = exp.Current();
+        for (auto& [flange, tools] : railsByFlange) {
+            const char* which = flange == bottomFlange ? "bottom" : "top";
+            TopTools_ListOfShape arguments;
+            arguments.Append(solids[flange]);
+            BRepAlgoAPI_Fuse fuse;
+            fuse.SetArguments(arguments);
+            fuse.SetTools(tools);
+            fuse.Build();
+            checkIsDone(fuse, flange == bottomFlange ? "bottom flange + pin rails" : "top flange + pin rails");
+            std::size_t fusedSolids = 0;
+            TopoDS_Shape fusedFlange;
+            for (TopExp_Explorer exp(fuse.Shape(), TopAbs_SOLID); exp.More(); exp.Next()) {
+                ++fusedSolids;
+                fusedFlange = exp.Current();
+            }
+            if (fusedSolids != 1)
+                throw std::runtime_error(std::string("BobbinBuilder: the ") + which + " flange and its " +
+                                         std::to_string(tools.Extent()) + " pin rail block(s) fuse into " +
+                                         std::to_string(fusedSolids) +
+                                         " solids; a rail that does not touch its flange would float in the model");
+            solids[flange] = fusedFlange;
+        }
         TopoDS_Compound comp;
         BRep_Builder bld;
         bld.MakeCompound(comp);
-        bld.Add(comp, solids[0]);
-        bld.Add(comp, solids[1]);
-        bld.Add(comp, fusedFlange);
+        for (const auto& solid : solids) bld.Add(comp, solid);
         bobbinShape = comp;
     }
 

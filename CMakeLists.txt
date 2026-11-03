@@ -141,15 +141,25 @@ set(ENABLE_NGSPICE    OFF CACHE BOOL "" FORCE)
 # the bobbin base/divider schema, MKF 6b23d51a with Bobbin::get_pin_rails and
 # Coil::terminal_exit_slots) are pushed, so the build no longer has to read the
 # developer's local clones -- which may be dirty or mid-rebase in a shared box.
-set(_MAS_LOCAL "https://github.com/OpenMagnetics/MAS.git")
-set(_MKF_LOCAL "https://github.com/OpenMagnetics/MKF.git")
+# Overridable so the native build can be pointed at a fork or a local clone
+# (e.g. -D MVBPP_MKF_REPOSITORY=file:///path/to/MKF -D MVBPP_MKF_TAG=my-branch).
+# Defaults are unchanged. Mirrors bindings/wasm/CMakeLists.txt.
+set(MVBPP_MAS_REPOSITORY "https://github.com/OpenMagnetics/MAS.git"
+    CACHE STRING "Git repository or file:// path to fetch MAS from")
+set(MVBPP_MKF_REPOSITORY "https://github.com/OpenMagnetics/MKF.git"
+    CACHE STRING "Git repository or file:// path to fetch MKF from")
+set(MVBPP_MAS_TAG "main" CACHE STRING "Git ref to check out for MAS")
+set(MVBPP_MKF_TAG "main" CACHE STRING "Git ref to check out for MKF")
+
+set(_MAS_LOCAL "${MVBPP_MAS_REPOSITORY}")
+set(_MKF_LOCAL "${MVBPP_MKF_REPOSITORY}")
 
 FetchContent_Declare(
     MAS
     GIT_REPOSITORY "${_MAS_LOCAL}"
     # Track MAS main. Provides the magneticApplication / subApplication schema
     # that MKF main (below) requires. Moves in lockstep with the MKF main pin.
-    GIT_TAG        main
+    GIT_TAG        "${MVBPP_MAS_TAG}"
     GIT_SHALLOW    FALSE
 )
 FetchContent_MakeAvailable(MAS)
@@ -169,7 +179,7 @@ FetchContent_Declare(
     # get_wire_insulation_relative_permittivity that OMFEM's electrostatic mesh needs is
     # now upstreamed on main (StrayCapacitance.h), so the old 028b3b9c pin is no longer
     # needed; pinning it against MAS-main caused a quicktype schema-skew codegen failure.
-    GIT_TAG        main
+    GIT_TAG        "${MVBPP_MKF_TAG}"
     GIT_SHALLOW    FALSE
     GIT_SUBMODULES ""
 )
@@ -267,6 +277,7 @@ add_library(mvb++ ${_mvbpp_lib_kind}
     src/shapes/ShapeRM.cpp
     src/shapes/ShapeT.cpp
     src/shapes/ShapeU.cpp
+    src/shapes/ShapeUi.cpp
     src/shapes/ShapeUr.cpp
     src/shapes/ShapeUt.cpp
     src/shapes/ShapeSlab.cpp

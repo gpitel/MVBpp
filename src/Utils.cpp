@@ -43,6 +43,21 @@
 
 namespace mvb {
 
+namespace {
+
+// The families MKF's Core constructor makes PIECE_AND_PLATE: a shaped piece closed by a plate,
+// ring or shell, not by a mirrored half. MKF main spells this list inline and has no helper for
+// it (Core::is_piece_and_plate_family lived only on the double-coil branch), so keep it in step
+// with Core.cpp's constructor cascade by hand.
+bool is_piece_and_plate_family(MAS::CoreShapeFamily family) {
+    return family == MAS::CoreShapeFamily::UI || family == MAS::CoreShapeFamily::PQI ||
+           family == MAS::CoreShapeFamily::UT || family == MAS::CoreShapeFamily::EI ||
+           family == MAS::CoreShapeFamily::DRUM_RING || family == MAS::CoreShapeFamily::DRUM_SEMISHIELDED ||
+           family == MAS::CoreShapeFamily::DRUM_PLATE;
+}
+
+}  // namespace
+
 double flatten_dimension(const MAS::Dimension& dim) {
     if (std::holds_alternative<MAS::DimensionWithTolerance>(dim)) {
         const auto& dwt = std::get<MAS::DimensionWithTolerance>(dim);
@@ -256,6 +271,8 @@ std::string core_shape_family_to_string(MAS::CoreShapeFamily family) {
         case MAS::CoreShapeFamily::ROD: return "rod";
         case MAS::CoreShapeFamily::T: return "t";
         case MAS::CoreShapeFamily::U: return "u";
+        case MAS::CoreShapeFamily::UI: return "ui";
+        case MAS::CoreShapeFamily::UR: return "ur";
         case MAS::CoreShapeFamily::UT: return "ut";
     }
     return "unknown";
@@ -345,6 +362,14 @@ OpenMagnetics::Magnetic magnetic_autocomplete_safe(const nlohmann::json& magneti
         auto shapeFamily = mutCore.get_shape_family();
         if (shapeFamily == MAS::CoreShapeFamily::T) {
             mutCore.get_mutable_functional_description().set_type(MAS::CoreType::TOROIDAL);
+        } else if (is_piece_and_plate_family(shapeFamily)) {
+            // A UI or PQI core is one piece closed by a flat plate, never a mirrored pair.
+            // Stamping TWO_PIECE_SET here sent process_data down its mirrored-pair branch,
+            // which DOUBLES the column height, winding-window height and area, le and
+            // effective volume -- so a core-only 3D preview was drawn at twice the real
+            // window height, with no error to say so. Same clobber MKF's own
+            // magnetic_autocomplete used to do.
+            mutCore.get_mutable_functional_description().set_type(MAS::CoreType::PIECE_AND_PLATE);
         } else {
             mutCore.get_mutable_functional_description().set_type(MAS::CoreType::TWO_PIECE_SET);
         }
@@ -505,7 +530,7 @@ TopoDS_Shape cut_bobbin(const TopoDS_Shape& bobbin, const std::vector<TopoDS_Sha
     if (scaledTools.empty()) return bobbin;
 
     // Iterate solids in the bobbin. BobbinBuilder returns a compound of
-    // body + topFlange + bottomFlange (3 solids) when flanges are present.
+    // body, flanges and dividers (one solid each) when flanges are present.
     // Per-solid AABB prefiltering means flange cuts only see the few turns
     // whose AABB actually pokes into the flange volume — typically 0 for a
     // tall winding. Drops `Cut` tool count from O(N) total to O(few) per

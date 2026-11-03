@@ -17,6 +17,7 @@
 #include "mvb/shapes/ShapeSlab.h"
 #include "mvb/shapes/ShapeT.h"
 #include "mvb/shapes/ShapeU.h"
+#include "mvb/shapes/ShapeUi.h"
 #include "mvb/shapes/ShapeUr.h"
 #include "mvb/shapes/ShapeUt.h"
 #include <memory>
@@ -60,6 +61,8 @@ std::unique_ptr<ShapeBuilder> createShapeBuilder(MAS::CoreShapeFamily family,
             break;
         case MAS::CoreShapeFamily::U:
             builder = std::make_unique<ShapeU>(); break;
+        case MAS::CoreShapeFamily::UI:  // U piece + flat I plate, one fused solid
+            builder = std::make_unique<ShapeUi>(); break;
         case MAS::CoreShapeFamily::UR:
             builder = std::make_unique<ShapeUr>(); break;
         case MAS::CoreShapeFamily::UT:
@@ -88,12 +91,14 @@ std::unique_ptr<ShapeBuilder> createShapeBuilder(MAS::CoreShapeFamily family,
             builder = std::make_unique<ShapePQ>(); break;
         case MAS::CoreShapeFamily::RM:
             builder = std::make_unique<ShapeRM>(); break;
-        // Slab cores (MKF CorePieceSlab, ABT #263): pot cores with two flats. RS is NOT here:
-        // its set pairs a slab half with a plain pot round, and the geometricalDescription
-        // MKF emits carries two identical RS halfSets, so nothing says which half is round.
+        // Slab cores (MKF CorePieceSlab, ABT #263): pot cores with two flats.
         case MAS::CoreShapeFamily::DS:
         case MAS::CoreShapeFamily::HS:
             builder = std::make_unique<ShapeSlab>(); break;
+        // RS (ABT #1443): a slab half paired with a plain pot round. The RS piece is the slab;
+        // buildCoreShapes draws a set's bottom half with ShapeRs::buildRoundHalf (see ShapeSlab.h).
+        case MAS::CoreShapeFamily::RS:
+            builder = std::make_unique<ShapeRs>(); break;
         default:
             return nullptr;
     }

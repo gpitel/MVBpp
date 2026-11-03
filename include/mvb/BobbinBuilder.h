@@ -19,10 +19,12 @@ public:
     //
     // pinRails (ABT #1249): MKF's Bobbin::get_pin_rails(), axis-aligned boxes in MKF's bobbin frame
     // (column axis Y, pin rows along X, the frame the pins are drawn in). They are FUSED with the
-    // bottom flange, so the flange and its rails are one solid of the bobbin compound (body, top
-    // flange, bottom flange + rails) under the bobbin's own name and Role::Bobbin. Each rail hangs
-    // from the bottom flange's outer face, so the fuse must come out as ONE solid: a rail that
-    // does not touch the flange it hangs from is refused, never drawn floating. The pins are
+    // flange they stand on, so the flange and its rails are one solid of the bobbin compound (body,
+    // top flange, bottom flange + rails) under the bobbin's own name and Role::Bobbin. A vertical
+    // former's rails hang from the bottom flange's outer face; a horizontal former's stand outboard
+    // of both end flanges, the -Y row on the bottom flange's outer face and the +Y row on the top
+    // flange's. Each flange and its rails must fuse into ONE solid: a rail that does not touch the
+    // flange it stands on is refused, never drawn floating. The pins are
     // separate solids that start on the rails' underside (touching, not overlapping), so the pin
     // cutters of the bobbin cut leave the rails intact. Needs axisIsY (only a Y-axis former has a
     // bottom flange in MKF's frame). Empty: exactly the former without rails.
