@@ -3,6 +3,7 @@
 #include <optional>
 
 #include "MAS.hpp"
+#include "constructive_models/Bobbin.h"
 #include "Utils.h"
 #include "mvb/ConductorBuilder.h"
 #include "mvb/NamedShape.h"
@@ -103,6 +104,14 @@ public:
     // been removed in favour of this Named API.
     std::vector<NamedShape> buildCoreNamed(const MAS::MagneticCore& core,
                                             int corePolygonSegments = DEFAULT_CORE_POLYGON_SEGMENTS) const;
+    // A horizontal former's pins hang from rails below the column (-Z), and they leave the core
+    // through its open side. A core whose post sits off its centre (the EP family: the post is
+    // 'K' from the open face and further from the back) is built with that open side up (+Z), so
+    // its back would run through the rails. This turns the core's shapes half a turn about the
+    // column axis (Y) when the rails are all below the column and the core reaches further
+    // below it than above. The post stays on the axis, so the turns and bobbin do not move.
+    static void turnCoreOpenSideToPinRails(std::vector<NamedShape>& shapes,
+                                           const std::vector<OpenMagnetics::Bobbin::PinRailBlock>& rails);
     std::vector<NamedShape> buildTurnsNamed(const MAS::Coil& coil,
                                             const MAS::MagneticCore& core,
                                             int wirePolygonSegments = DEFAULT_WIRE_POLYGON_SEGMENTS,

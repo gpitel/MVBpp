@@ -450,6 +450,29 @@ async function main() {
         assertEqual(mvbpp.drawPins(JSON.stringify(ONE_WINDOW), ...STL).length, 0);
     });
 
+    // A two-chamber horizontal former (Ferroxcube CSH-EP13-2S-10P) on an EP 13 core. Its pins hang
+    // from rails r3 = 2.5 to r1 = 5.2 mm below the column, outboard of end flanges at 4.4 mm, out
+    // to b/2 = 6.8 mm. The core's post sits K = 2.25 mm from its open face and 6.55 mm from its
+    // back, and MKF builds it with the open side up (+Z), so its back would run through the rails.
+    const EP13 = fs.readFileSync(path.join(TESTS_DIR, 'ep13_10p_horizontal_magnetic.json'), 'utf8');
+
+    test('drawBobbin hangs a two-chamber former\'s rails from its end flanges', () => {
+        const b = stlBounds(mvbpp.drawBobbin(JSON.stringify(JSON.parse(EP13).coil.bobbin), ...STL));
+        assertClose(b.min[0], -0.0068, 1e-6, 'rail across a: -x');
+        assertClose(b.min[1], -0.0068, 1e-6, 'row 0 rail out to -b/2');
+        assertClose(b.max[1], 0.0068, 1e-6, 'row 1 rail out to +b/2');
+        assertClose(b.min[2], -0.0052, 1e-6, 'rails down to r1');
+    });
+
+    test('drawCore of a magnetic turns an EP core\'s open side down to its former\'s pin rails', () => {
+        const turned = stlBounds(mvbpp.drawCore(EP13, ...STL));
+        assertClose(turned.min[2], -0.00225, 2e-5, 'open face above the rails');
+        assertClose(turned.max[2], 0.00655, 2e-5, 'back up, away from the board');
+        const alone = stlBounds(mvbpp.drawCore(JSON.stringify(JSON.parse(EP13).core), ...STL));
+        assertClose(alone.max[2], 0.00225, 2e-5, 'a core alone keeps its open side up');
+        assertClose(alone.min[2], -0.00655, 2e-5, 'a core alone keeps its back down');
+    });
+
     // ── drawTurns ────────────────────────────────────────────────────────────
 
     console.log('\nmvbpp WASM — drawTurns');

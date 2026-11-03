@@ -293,7 +293,7 @@ std::string deliver(std::vector<mvb::NamedShape> named,
 
 // ── Per-function builders ───────────────────────────────────────────────────
 
-std::vector<mvb::NamedShape> build_core(const std::string& json_str, int polygonSegments) {
+std::vector<mvb::NamedShape> build_core_unturned(const std::string& json_str, int polygonSegments) {
     nlohmann::json j;
     try { j = json::parse(json_str); }
     catch (const std::exception& e) {
@@ -345,6 +345,20 @@ std::vector<mvb::NamedShape> build_core(const std::string& json_str, int polygon
     const auto& core = enriched.get_core();
     mvb::MagneticBuilder b;
     return b.buildCoreNamed(core, polygonSegments);
+}
+
+// drawCore of a magnetic: the core with its open side toward the bobbin's pin rails, as the
+// whole-magnetic builds place it (MagneticBuilder::turnCoreOpenSideToPinRails). A core alone, or
+// a coil without a bobbin record, is drawn as built.
+std::vector<mvb::NamedShape> build_core(const std::string& json_str, int polygonSegments) {
+    auto named = build_core_unturned(json_str, polygonSegments);
+    const auto j = json::parse(json_str);
+    if (j.contains("coil") && j.at("coil").contains("bobbin") && j.at("coil").at("bobbin").is_object() &&
+        j.at("coil").at("bobbin").contains("processedDescription")) {
+        mvb::MagneticBuilder::turnCoreOpenSideToPinRails(
+            named, OpenMagnetics::Bobbin(j.at("coil").at("bobbin")).get_pin_rails());
+    }
+    return named;
 }
 
 std::vector<mvb::NamedShape> build_spacer(const std::string& json_str, int /*polygonSegments*/) {
