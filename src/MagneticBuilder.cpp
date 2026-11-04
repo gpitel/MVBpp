@@ -46,6 +46,8 @@
 #include <BRepAlgoAPI_Common.hxx>
 #include <Bnd_Box.hxx>
 #include "support/Settings.h"
+#include <gp_Ax1.hxx>
+#include <gp_Dir.hxx>
 #include <gp_Pnt.hxx>
 #include <gp_Trsf.hxx>
 #include <numbers>
@@ -915,6 +917,30 @@ Role turn_role_for(const std::string& name) {
 
 } // anonymous namespace
 
+void MagneticBuilder::turnCoreOpenSideToPinRails(std::vector<NamedShape>& shapes,
+                                                 const std::vector<OpenMagnetics::Bobbin::PinRailBlock>& rails) {
+    if (rails.empty()) return;
+    for (const auto& rail : rails) {
+        // A vertical former's rails hang along -Y, one row on each side of the column in Z.
+        if (rail.centre.size() != 3 || rail.halfExtents.size() != 3 ||
+            rail.centre[2] + rail.halfExtents[2] > 0.0) return;
+    }
+    Bnd_Box box;
+    for (const auto& ns : shapes)
+        if (ns.role == Role::Core || ns.role == Role::CoreCoating) BRepBndLib::Add(ns.shape, box);
+    if (box.IsVoid()) return;
+    double xMin, yMin, zMin, xMax, yMax, zMax;
+    box.Get(xMin, yMin, zMin, xMax, yMax, zMax);
+    // A core that is the same both sides of the column (ETD, E) has nothing to turn. 1 um is far
+    // below any core's asymmetry (EP13: 2.25 mm open side, 6.55 mm back) and above Bnd_Box's gap.
+    if (-zMin <= zMax + 1e-6) return;
+    gp_Trsf halfTurn;
+    halfTurn.SetRotation(gp_Ax1(gp_Pnt(0, 0, 0), gp_Dir(0, 1, 0)), std::numbers::pi);
+    for (auto& ns : shapes)
+        if (ns.role == Role::Core || ns.role == Role::CoreCoating)
+            ns.shape = BRepBuilderAPI_Transform(ns.shape, halfTurn, true).Shape();
+}
+
 // ---- Named-shape overloads ------------------------------------------------
 
 std::vector<NamedShape> MagneticBuilder::buildCoreNamed(const MAS::MagneticCore& core,
@@ -1044,6 +1070,7 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const MAS::Magnetic& magn
         }
         // Build directly from MAS types — no MKF enrichment needed.
         auto all = buildCoreNamed(core, corePolygonSegments);
+        turnCoreOpenSideToPinRails(all, getPinRails(coil));
 
         if (coreCoatingThickness > 0.0) {   // conformal core-coating shells (offset core - core)
             std::vector<NamedShape> coatings;
@@ -1149,6 +1176,7 @@ std::vector<NamedShape> MagneticBuilder::buildAllNamed(const OpenMagnetics::Magn
                                                          EnamelGateVerdict* enamelGateVerdictOut) const {
     if (enamelGateVerdictOut) *enamelGateVerdictOut = EnamelGateVerdict::NotRun;
     auto all = buildCoreNamed(magnetic.get_core(), corePolygonSegments);
+    turnCoreOpenSideToPinRails(all, getPinRails(magnetic.get_coil()));
 
     if (coreCoatingThickness > 0.0) {   // conformal core-coating shells (offset core - core)
         std::vector<NamedShape> coatings;
