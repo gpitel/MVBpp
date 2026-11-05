@@ -17805,6 +17805,9 @@ std::vector<NamedShape> buildAllImplOnce(const CoilT& coil,
             }
         }
         out.push_back({cond, p.name, std::move(partNames), Role::Turn});   // ABT #1169
+        // A foil lead in the bobbin's cutter build is MKF's axial lead: it leaves THROUGH the
+        // flange (AxialLead::end lies past the end face), so it pierces the bobbin.
+        if (opts.cutterOnly && p.isFoil && p.leadOnlyTerminal >= 0) out.back().piercesBobbin = true;
         // PORT SURFACES for full-wave / FEM: the two free ends of a continuous round conductor are
         // its only PLANAR faces (the swept lateral surface is a cylinder/torus/BSpline, the elbows
         // are spheres/tori) -- MVB++ caps them flat precisely so a solver can put a port BC there.
@@ -18596,6 +18599,8 @@ ConductorBuilder::LeadBendPolicy::LeadBendPolicy(double minBendRadius) {
     auto& settings = OpenMagnetics::Settings::GetInstance();
     _previousFactor = settings.get_coil_lead_bend_radius_factor();
     _previousMinimum = settings.get_coil_lead_minimum_bend_radius();
+    _previousRealWinding = settings.get_coil_use_real_winding_geometry();
+    settings.set_coil_use_real_winding_geometry(true);
     settings.set_coil_lead_bend_radius_factor(std::optional<double>(kRoundCornerBendFactor));
     settings.set_coil_lead_minimum_bend_radius(minBendRadius > 0 ? std::optional<double>(minBendRadius)
                                                                  : std::nullopt);
@@ -18605,6 +18610,7 @@ ConductorBuilder::LeadBendPolicy::~LeadBendPolicy() {
     auto& settings = OpenMagnetics::Settings::GetInstance();
     settings.set_coil_lead_bend_radius_factor(_previousFactor);
     settings.set_coil_lead_minimum_bend_radius(_previousMinimum);
+    settings.set_coil_use_real_winding_geometry(_previousRealWinding);
 }
 
 } // namespace mvb

@@ -113,6 +113,14 @@ std::vector<std::string> get_supported_families();
 // (MVB test data often has only min/max)
 void patch_dimension_nominals(nlohmann::json& j);
 
+// A MAS magnetic from JSON, read the way MKF reads it: MKF's compat::migrate_pre_1_0 first brings
+// an older MAS file up to the current schema (pre-1.0 enum spellings such as "half set" ->
+// "halfSet", a core material's single "application" string -> the list MAS now holds), then the
+// generated MAS types parse it. Every MVB++ entry point that takes MAS JSON goes through here, so a
+// file MKF accepts is never refused by MVB++ alone. `j` may be a whole MAS document (its "magnetic"
+// is taken) or a bare magnetic.
+MAS::Magnetic magnetic_from_json(nlohmann::json j);
+
 // Safely enrich a raw MAS::Magnetic using MKF's magnetic_autocomplete.
 // This avoids object-slicing and Coil::wind() crashes for raw MAS files
 // (e.g. with "Basic" bobbins) by constructing OpenMagnetics::Coil with
@@ -129,6 +137,11 @@ OpenMagnetics::Magnetic magnetic_autocomplete_safe(const nlohmann::json& magneti
 
 // Helpers for cutting bobbin with cores/turns to match Python MVB behavior
 bool is_shape_usable(const TopoDS_Shape& shape);
-TopoDS_Shape cut_bobbin(const TopoDS_Shape& bobbin, const std::vector<TopoDS_Shape>& cutters);
+// `touching`: tools that only rest against the bobbin (core, wound turns) -- cut with OCCT's
+// glue option, fast on their many coincident/tangent contacts. `piercing`: tools that pass
+// THROUGH a bobbin solid (pins, shunts, a foil's axial lead) -- cut without glue, because glue
+// skips face/face intersections and a glued cut leaves the pierced solid untouched.
+TopoDS_Shape cut_bobbin(const TopoDS_Shape& bobbin, const std::vector<TopoDS_Shape>& touching,
+                        const std::vector<TopoDS_Shape>& piercing = {});
 
 } // namespace mvb
