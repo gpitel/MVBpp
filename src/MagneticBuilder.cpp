@@ -347,6 +347,51 @@ namespace {
 // for emitting core shapes is buildCoreNamed(). Callers that don't need the
 // piece names use this directly; callers that need names go through
 // MagneticBuilder::buildCoreNamed.
+// The PLATE element of a piece-and-plate core (ABT #2372). EI, UI and PQI close their shaped piece
+// with a flat bar of the piece's footprint, A wide and C deep, and B2 thick (MKF CorePieceEi/Ui/Pqi
+// count B2 as the plate's yoke). MKF places the plate at the piece's leg tips: its coordinates are
+// the face that meets the legs, and the plate extends B2 away from the piece, towards +Y.
+// Returns a null shape for the closers a family builder already draws as part of its piece (the
+// drum ring's shield and the semi-shielded drum's shell come from their applyExtras; ShapeUt builds
+// the U and its T bar as one closed solid). Any other family's plate has no builder: that throws,
+// rather than drawing a core with its closer missing.
+TopoDS_Shape buildPlate(const MAS::CoreGeometricalDescriptionElement& piece) {
+    auto shapeOpt = piece.get_shape();
+    if (!shapeOpt) throw std::runtime_error("buildPlate: a PLATE element carries no shape");
+    const MAS::CoreShape* shapeData = std::get_if<MAS::CoreShape>(&*shapeOpt);
+    if (!shapeData) throw std::runtime_error("buildPlate: a PLATE element's shape is a name, not resolved shape data");
+    const auto family = shapeData->get_family();
+    const std::string shapeName = shapeData->get_name().value_or(std::string("?"));
+    if (family == MAS::CoreShapeFamily::DRUM_RING || family == MAS::CoreShapeFamily::DRUM_SEMISHIELDED ||
+        family == MAS::CoreShapeFamily::UT) {
+        return TopoDS_Shape();
+    }
+    if (family != MAS::CoreShapeFamily::EI && family != MAS::CoreShapeFamily::UI && family != MAS::CoreShapeFamily::PQI) {
+        throw std::runtime_error("buildPlate: no 3D geometry builder for the plate of core family '" +
+                                 nlohmann::json(family).get<std::string>() + "' (shape '" + shapeName + "')");
+    }
+    if (!shapeData->get_dimensions())
+        throw std::runtime_error("buildPlate: shape '" + shapeName + "' has no dimensions");
+    const auto dims = flatten_dimensions(*shapeData->get_dimensions());
+    for (const char* key : {"A", "B2", "C"}) {
+        auto it = dims.find(key);
+        if (it == dims.end() || !(it->second > 0))
+            throw std::runtime_error(std::string("buildPlate: shape '") + shapeName + "' has no positive dimension " + key +
+                                     ", which the plate of a piece-and-plate core is built from");
+    }
+    const double a = dims.at("A"), b2 = dims.at("B2"), c = dims.at("C");
+    TopoDS_Shape plate = BRepPrimAPI_MakeBox(gp_Pnt(-a / 2.0, 0.0, -c / 2.0), a, b2, c).Shape();
+    auto rotOpt = piece.get_rotation();
+    if (rotOpt && rotOpt->size() >= 3) {
+        plate = rotate_shape(plate, (*rotOpt)[0], (*rotOpt)[1], (*rotOpt)[2]);
+    }
+    if (piece.get_machining() && !piece.get_machining()->empty())
+        throw std::runtime_error("buildPlate: the plate of '" + shapeName + "' carries machining; a plate is flat and is not machined");
+    const auto& coords = piece.get_coordinates();
+    if (coords.size() < 3) throw std::runtime_error("buildPlate: the plate of '" + shapeName + "' has no coordinates");
+    return translate_shape(plate, coords[0], coords[1], coords[2]);
+}
+
 std::vector<TopoDS_Shape> buildCoreShapes_impl(const MAS::MagneticCore& core,
                                                int corePolygonSegments) {
     std::vector<TopoDS_Shape> result;
@@ -354,10 +399,15 @@ std::vector<TopoDS_Shape> buildCoreShapes_impl(const MAS::MagneticCore& core,
     if (!geoOpt) return result;
 
     for (const auto& piece : *geoOpt) {
+        // PLATE: the closer of a piece-and-plate core (ABT #264, ABT #2372).
+        if (piece.get_type() == MAS::CoreGeometricalDescriptionElementType::PLATE) {
+            auto plate = buildPlate(piece);
+            if (!plate.IsNull()) result.push_back(plate);
+            continue;
+        }
         // CLOSED covers single-solid cores (UT, and DRUM per ABT #331): their family
         // builders emit the complete piece, so they go through the same path as
-        // HALF_SET. PLATE (piece-and-plate closers, ABT #264) still needs a
-        // plate-dimension build and is not handled yet.
+        // HALF_SET.
         if (piece.get_type() != MAS::CoreGeometricalDescriptionElementType::HALF_SET
             && piece.get_type() != MAS::CoreGeometricalDescriptionElementType::TOROIDAL
             && piece.get_type() != MAS::CoreGeometricalDescriptionElementType::CLOSED) {
@@ -586,6 +636,11 @@ static void checkPinRailCollisions(const std::vector<OpenMagnetics::Bobbin::PinR
     }
 }
 
+template<typename CoilT>
+TopoDS_Shape buildWoundLegBobbins(const CoilT& coil, const MAS::MagneticCore& core,
+                                  const MAS::CoreBobbinProcessedDescription& bobbinPd, double flangeThickness,
+                                  int polygonSegments, bool& mainWound);
+
 // Internal bobbin builder. Public surface goes through buildBobbinNamed().
 template<typename CoilT>
 TopoDS_Shape buildBobbinShape_impl(const CoilT& coil, const MAS::MagneticCore& core,
@@ -617,8 +672,21 @@ TopoDS_Shape buildBobbinShape_impl(const CoilT& coil, const MAS::MagneticCore& c
     // actual winding-window cross-section, or BobbinBuilder is using the
     // wrong flange topology. Either way, the fix belongs upstream (in
     // BobbinBuilder or in MAS), not in a silent post-hoc cut here.
-    return BobbinBuilder::buildBobbin(bobbinPd, flangeThickness, !isCoreToroidal(core), polygonSegments,
-                                      getPinRails(coil));   // ABT #1249
+    // ABT #2274: a multi-column design wound on its lateral legs draws MKF's former on each wound leg, and the
+    // main column's only when a section is wound there (buildWoundLegBobbins).
+    bool mainWound = true;
+    TopoDS_Shape legFormers = buildWoundLegBobbins(coil, core, bobbinPd, flangeThickness, polygonSegments, mainWound);
+    if (legFormers.IsNull()) {
+        return BobbinBuilder::buildBobbin(bobbinPd, flangeThickness, !isCoreToroidal(core), polygonSegments,
+                                          getPinRails(coil));   // ABT #1249
+    }
+    if (!mainWound) return legFormers;
+    TopoDS_Compound comp;
+    BRep_Builder bld;
+    bld.MakeCompound(comp);
+    bld.Add(comp, BobbinBuilder::buildBobbin(bobbinPd, flangeThickness, !isCoreToroidal(core), polygonSegments, {}));
+    bld.Add(comp, legFormers);
+    return comp;
 }
 
 // ---- Multi-column placement resolution -------------------------------------------------------
@@ -693,6 +761,16 @@ public:
                 }
             }
         }
+    }
+
+    // The winding window a section (else its winding) is placed in -- the lookup resolve() starts from.
+    int64_t windowIndexOf(const std::optional<std::string>& sectionName, const std::string& windingName) const {
+        if (sectionName) {
+            auto it = _sectionWindow.find(*sectionName);
+            if (it != _sectionWindow.end()) return it->second;
+        }
+        auto it = _windingWindow.find(windingName);
+        return it != _windingWindow.end() ? it->second : 0;
     }
 
     std::optional<TurnBuilder::WoundColumnSpec>
@@ -786,6 +864,105 @@ std::map<std::string, TurnBuilder::WoundColumnSpec> resolveWoundColumnsPerSectio
         }
     }
     return out;
+}
+
+// ABT #2274 (Alf, 2026-11-08: "for multicolumn, the bobbin must be drawn on the leg with the windings, not on the
+// middle"). A section placed in a winding window whose column edge is a LATERAL leg is wound on MKF's lateral former:
+// Coil::get_wound_column_frame_for_section ("the lateral bobbin wraps its leg like the main one wraps the main
+// column": half width/depth = leg/2 + column thickness, MKF's moulded corner, axis at the leg). Each wound leg gets
+// that former, built by the same BobbinBuilder rule as the main one from MKF's frame and its own winding window, at
+// the leg's MAS x. The main-column former is drawn only when a section is wound there (mainWound). A design whose
+// sections all wrap the main column returns a null shape and keeps the single-former path unchanged.
+template<typename CoilT>
+TopoDS_Shape buildWoundLegBobbins(const CoilT& coil, const MAS::MagneticCore& core,
+                                  const MAS::CoreBobbinProcessedDescription& bobbinPd, double flangeThickness,
+                                  int polygonSegments, bool& mainWound) {
+    mainWound = false;
+    auto sectionsOpt = coil.get_sections_description();
+    if (!sectionsOpt) {
+        mainWound = true;
+        return TopoDS_Shape();
+    }
+    const WoundColumnResolver resolver(coil, core, bobbinPd);
+    struct Leg { int64_t window; std::string section; TurnBuilder::WoundColumnSpec spec; };
+    std::vector<Leg> legs;
+    for (const auto& section : *sectionsOpt) {
+        auto spec = resolver.resolve(section.get_name(), "", section.get_name());
+        if (!spec) {
+            mainWound = true;
+            continue;
+        }
+        const int64_t window = resolver.windowIndexOf(section.get_name(), "");
+        bool known = false;
+        for (const auto& leg : legs) {
+            if (std::abs(leg.spec.axisX - spec->axisX) < 1e-12) {
+                if (leg.window != window) {
+                    throw std::runtime_error("buildWoundLegBobbins: sections '" + leg.section + "' (window " +
+                                             std::to_string(leg.window) + ") and '" + section.get_name() + "' (window " +
+                                             std::to_string(window) + ") wrap the same leg x = " +
+                                             std::to_string(spec->axisX * 1e3) + " mm from two winding windows; one former per "
+                                             "leg is drawn from one window");
+                }
+                known = true;
+            }
+        }
+        if (!known) legs.push_back({window, section.get_name(), *spec});
+    }
+    if (legs.empty()) return TopoDS_Shape();
+    if (!getPinRails(coil).empty()) {
+        throw std::runtime_error("buildWoundLegBobbins: MKF's pin rails hang from the main former's bottom flange; a "
+                                 "multi-column design wound on lateral legs carries rails no lateral former is drawn for");
+    }
+    const auto& windows = bobbinPd.get_winding_windows();
+    TopoDS_Compound comp;
+    BRep_Builder bld;
+    bld.MakeCompound(comp);
+    for (const auto& leg : legs) {
+        OpenMagnetics::WoundColumnFrame frame;
+        if constexpr (std::is_same_v<CoilT, OpenMagnetics::Coil>) {
+            OpenMagnetics::Coil c = coil;
+            frame = c.get_wound_column_frame_for_section(leg.section);
+        }
+        else {
+            throw std::runtime_error("buildWoundLegBobbins: the former on a lateral leg is MKF's wound column frame, which "
+                                     "only an MKF-wound OpenMagnetics::Coil carries");
+        }
+        if (std::abs(frame.axisX - std::abs(leg.spec.axisX)) > 1e-12 ||
+            std::abs(frame.columnWidth - leg.spec.halfWidth) > 1e-12 ||
+            std::abs(frame.columnDepth - leg.spec.halfDepth) > 1e-12) {
+            throw std::runtime_error("buildWoundLegBobbins: MKF's wound column frame of section '" + leg.section +
+                                     "' (axis " + std::to_string(frame.axisX * 1e3) + " mm, half " +
+                                     std::to_string(frame.columnWidth * 1e3) + " x " + std::to_string(frame.columnDepth * 1e3) +
+                                     " mm) disagrees with the leg its turns are drawn on (axis " +
+                                     std::to_string(leg.spec.axisX * 1e3) + " mm, half " + std::to_string(leg.spec.halfWidth * 1e3) +
+                                     " x " + std::to_string(leg.spec.halfDepth * 1e3) + " mm)");
+        }
+        if (leg.window < 0 || static_cast<std::size_t>(leg.window) >= windows.size()) {
+            throw std::runtime_error("buildWoundLegBobbins: section '" + leg.section + "' is in winding window " +
+                                     std::to_string(leg.window) + " but the bobbin states " + std::to_string(windows.size()));
+        }
+        auto legPd = bobbinPd;
+        legPd.set_column_shape(frame.shape);
+        legPd.set_column_width(frame.columnWidth);
+        legPd.set_column_depth(frame.columnDepth);
+        if (frame.shape == MAS::ColumnShape::RECTANGULAR || frame.shape == MAS::ColumnShape::IRREGULAR) {
+            legPd.set_column_corner_radius(frame.cornerRadius);
+        }
+        legPd.set_winding_windows({windows[static_cast<std::size_t>(leg.window)]});
+        TopoDS_Shape former = BobbinBuilder::buildBobbin(legPd, flangeThickness, true, polygonSegments, {});
+        if (former.IsNull()) {
+            throw std::runtime_error("buildWoundLegBobbins: the former of section '" + leg.section + "' built empty");
+        }
+        if (std::getenv("MVB_LEAD_DIAG")) {
+            std::cerr << std::setprecision(9) << "[leg-bobbin] section " << leg.section << " window " << leg.window
+                      << " axis x " << leg.spec.axisX * 1e3 << " mm half " << frame.columnWidth * 1e3 << " x "
+                      << frame.columnDepth * 1e3 << " mm corner " << frame.cornerRadius * 1e3 << " mm window "
+                      << windows[static_cast<std::size_t>(leg.window)].get_width().value_or(-1) * 1e3 << " x "
+                      << windows[static_cast<std::size_t>(leg.window)].get_height().value_or(-1) * 1e3 << " mm\n";
+        }
+        bld.Add(comp, translate_shape(former, leg.spec.axisX, 0.0, 0.0));
+    }
+    return comp;
 }
 
 // Internal turns builder. Public surface goes through buildTurnsNamed() or

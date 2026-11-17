@@ -41,13 +41,17 @@ set(OCCT_ESSENTIAL_LIBS
     TKTObj TKBinTObj TKXmlTObj
     TKDEGLTF TKDEOBJ TKDEPLY TKDEVRML
 )
-set(OCCT_BYPRODUCTS "")
+# Full paths of the static toolkit archives: libTKernel.a on Linux/macOS, TKernel.lib on MSVC.
+set(OCCT_STATIC_LIB_FILES "")
 foreach(_l ${OCCT_ESSENTIAL_LIBS})
-    list(APPEND OCCT_BYPRODUCTS "${OCCT_PREFIX}/lib/lib${_l}.a")
+    list(APPEND OCCT_STATIC_LIB_FILES
+        "${OCCT_PREFIX}/lib/${CMAKE_STATIC_LIBRARY_PREFIX}${_l}${CMAKE_STATIC_LIBRARY_SUFFIX}")
 endforeach()
+set(OCCT_BYPRODUCTS ${OCCT_STATIC_LIB_FILES})
 
 # A prefix that already holds every toolkit is reused, never rebuilt: re-running the
 # ExternalProject from a fresh build tree reinstalls OCCT over a prefix other builds are linking.
+# (The wheel CI relies on this too: one OCCT build per job serves every Python version.)
 set(_occt_installed TRUE)
 foreach(_b ${OCCT_BYPRODUCTS})
     if(NOT EXISTS "${_b}")
@@ -61,6 +65,10 @@ else()
 ExternalProject_Add(
     occt_external
     URL https://github.com/Open-Cascade-SAS/OCCT/archive/refs/tags/V7_9_3.tar.gz
+    # Explicit Release config: under a multi-config generator (Visual Studio, used for the
+    # Windows wheel) a bare `cmake --build` builds Debug, whose archives the Release link rejects.
+    BUILD_COMMAND   ${CMAKE_COMMAND} --build <BINARY_DIR> --config Release
+    INSTALL_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --config Release --target install
     CMAKE_ARGS
         -DCMAKE_BUILD_TYPE=Release
         -DCMAKE_POSITION_INDEPENDENT_CODE=ON
@@ -97,15 +105,33 @@ target_link_directories(occt INTERFACE ${OCCT_PREFIX}/lib)
 # GProp_PGProps, ...). Wrap the whole set in --start-group/--end-group so ld
 # iterates the archives until all cross-references resolve. Use full .a paths so
 # the group survives CMake's link-item processing.
-set(_occt_group_libs)
-foreach(_lib ${OCCT_ESSENTIAL_LIBS})
-    list(APPEND _occt_group_libs "${OCCT_PREFIX}/lib/lib${_lib}.a")
-endforeach()
-target_link_libraries(occt INTERFACE
-    -Wl,--start-group
-    ${_occt_group_libs}
-    -Wl,--end-group
-)
+# Apple ld64 and MSVC link.exe already search archives repeatedly, so they take the plain list,
+# plus the system libraries OCCT's EXTERNLIB files name for the toolkits above (static OCCT
+# does not carry them along): TKernel/TKService/TKV3d on Windows; TKService (Cocoa windows,
+# IOKit) and TKV3d (OpenGL) on macOS.
+if(UNIX AND NOT APPLE)
+    target_link_libraries(occt INTERFACE
+        -Wl,--start-group
+        ${OCCT_STATIC_LIB_FILES}
+        -Wl,--end-group
+    )
+elseif(APPLE)
+    target_link_libraries(occt INTERFACE
+        ${OCCT_STATIC_LIB_FILES}
+        objc "-framework AppKit" "-framework IOKit" "-framework OpenGL")
+elseif(WIN32)
+    target_link_libraries(occt INTERFACE
+        ${OCCT_STATIC_LIB_FILES}
+        advapi32 gdi32 user32 ws2_32 psapi winmm opengl32)
+endif()
+
+# MSVC: large TUs (MKF, ConductorBuilder.cpp) need /bigobj, as PyOpenMagnetics' Windows build of
+# MKF does; the sources are UTF-8 (µ, ×, — in literals and comments), hence /utf-8.
+# /MP: compile a project's files in parallel. MSBuild otherwise builds one file at a time inside each
+# project, and MKF is one large project (a Windows wheel spent ~65 min per Python version in it).
+if(MSVC)
+    add_compile_options(/bigobj /utf-8 /MP)
+endif()
 
 # ============================================================================
 # nlohmann/json — reused by both MKF and MVB++
@@ -264,6 +290,7 @@ add_library(mvb++ ${_mvbpp_lib_kind}
     src/shapes/ShapeDrum.cpp
     src/shapes/ShapeDrumRing.cpp
     src/shapes/ShapeMolded.cpp
+    src/shapes/ShapeRod.cpp
     src/shapes/ShapeDrumSemishielded.cpp
     src/shapes/ShapeE.cpp
     src/shapes/ShapeEp.cpp
@@ -295,6 +322,12 @@ target_include_directories(mvb++ PUBLIC
     ${CMAKE_BINARY_DIR}/_deps/magic-enum-src/include/magic_enum
     ${CMAKE_BINARY_DIR}/_deps/svg-src/src
 )
+
+# MSVC: <windows.h> defines `near` and `far` as empty macros, which MVB++ uses as identifiers;
+# cmake/msvc_windows_macros.h includes it first and drops them.
+if(MSVC)
+    target_compile_options(mvb++ PRIVATE "/FI${CMAKE_CURRENT_SOURCE_DIR}/cmake/msvc_windows_macros.h")
+endif()
 
 target_link_libraries(mvb++ PUBLIC
     occt
@@ -344,6 +377,7 @@ add_executable(mvb_tests
     tests/test_sleeves.cpp
     tests/test_slab_cores.cpp
     tests/test_bobbin_corner.cpp
+    tests/test_piece_and_plate.cpp
 )
 if(MVBPP_BUILD_MESH)
     target_sources(mvb_tests PRIVATE tests/test_mesh_io.cpp)
@@ -404,22 +438,13 @@ if(BUILD_PYTHON_BINDINGS)
     )
     FetchContent_MakeAvailable(pybind11)
     pybind11_add_module(mvbpp bindings/python/mvbpp_python.cpp)
+    if(MSVC)
+        target_compile_options(mvbpp PRIVATE "/FI${CMAKE_CURRENT_SOURCE_DIR}/cmake/msvc_windows_macros.h")
+    endif()
     install(TARGETS mvbpp
             LIBRARY DESTINATION .
             COMPONENT PythonModule
             EXCLUDE_FROM_ALL)
-
-    # Static OCCT requires --whole-archive when linked into a shared object
-    # to pull in all vtable/typeinfo symbols the linker would otherwise drop.
-    set(_occt_static_libs)
-    foreach(_lib ${OCCT_ESSENTIAL_LIBS})
-        list(APPEND _occt_static_libs "${OCCT_PREFIX}/lib/lib${_lib}.a")
-    endforeach()
-    target_link_options(mvbpp PRIVATE
-        "LINKER:--whole-archive"
-        ${_occt_static_libs}
-        "LINKER:--no-whole-archive"
-    )
 
     target_include_directories(mvbpp PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/include
@@ -428,8 +453,32 @@ if(BUILD_PYTHON_BINDINGS)
         ${CMAKE_BINARY_DIR}/_deps/spline-src/src
         ${CMAKE_BINARY_DIR}/_deps/magic-enum-src/include/magic_enum
     )
-    target_link_libraries(mvbpp PRIVATE
-        "-Wl,--whole-archive" mvb++ "-Wl,--no-whole-archive")
+
+    # Static OCCT and mvb++ are linked WHOLE into the module, to pull in all vtable/typeinfo
+    # symbols the linker would otherwise drop. Each linker spells it differently.
+    if(UNIX AND NOT APPLE)
+        target_link_options(mvbpp PRIVATE
+            "LINKER:--whole-archive"
+            ${OCCT_STATIC_LIB_FILES}
+            "LINKER:--no-whole-archive"
+        )
+        target_link_libraries(mvbpp PRIVATE
+            "-Wl,--whole-archive" mvb++ "-Wl,--no-whole-archive")
+    elseif(APPLE)
+        foreach(_a ${OCCT_STATIC_LIB_FILES})
+            target_link_options(mvbpp PRIVATE "LINKER:-force_load,${_a}")
+        endforeach()
+        target_link_options(mvbpp PRIVATE "LINKER:-force_load,$<TARGET_FILE:mvb++>")
+        target_link_libraries(mvbpp PRIVATE mvb++)
+    elseif(MSVC)
+        # OCCT is NOT whole-archived here: every OCCT .lib carries its own version resource (.res), and
+        # /WHOLEARCHIVE pulls them all in, which link.exe refuses (LNK1241 "resource file already
+        # specified"). link.exe resolves the OCCT objects mvb++ needs from the plain list on `occt`.
+        target_link_options(mvbpp PRIVATE "/WHOLEARCHIVE:$<TARGET_FILE:mvb++>")
+        target_link_libraries(mvbpp PRIVATE mvb++)
+    else()
+        message(FATAL_ERROR "BUILD_PYTHON_BINDINGS: no whole-archive link recipe for this toolchain")
+    endif()
 
     # Static OCCT's TKService references X11 symbols (XOpenDisplay,
     # XGetVisualInfo, XGetWindowAttributes) for offscreen visual queries.
