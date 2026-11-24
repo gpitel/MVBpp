@@ -113,7 +113,8 @@ std::vector<NamedShape> BobbinBuilder::buildPinRailsNamed(const std::vector<Open
 }
 
 TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescription& bobbin, double flangeThickness, bool axisIsY, int polygonSegments,
-                                        const std::vector<OpenMagnetics::Bobbin::PinRailBlock>& pinRails) {
+                                        const std::vector<OpenMagnetics::Bobbin::PinRailBlock>& pinRails,
+                                        std::optional<double> flangeOverhangLimit) {
     if (flangeThickness < 0.0 || std::isnan(flangeThickness)) {
         throw std::invalid_argument("BobbinBuilder: flangeThickness is invalid");
     }
@@ -161,6 +162,13 @@ TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescriptio
     }
     const double height = zHigh - zLow;
     if (height <= 0.0) return TopoDS_Shape();
+    // How far the flanges stand out from the tube, on every side: the window's width, or the room a neighbouring
+    // wound column's former leaves when that is less (flangeOverhangLimit).
+    if (flangeOverhangLimit && !(*flangeOverhangLimit > 0.0)) {
+        throw std::invalid_argument("BobbinBuilder: the flange overhang limit must be > 0, got " +
+                                    std::to_string(*flangeOverhangLimit) + " m");
+    }
+    const double flangeOverhang = flangeOverhangLimit ? std::min(wwWidth, *flangeOverhangLimit) : wwWidth;
 
     // The tube is built in pieces that stop at the dividers, and every plate (an
     // end flange or a divider) is cut at the bore. A moulded bobbin is one part: a
@@ -205,7 +213,7 @@ TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescriptio
         };
 
         if (hasFlanges) {
-            double flangeOuterR = outerR + wwWidth;
+            double flangeOuterR = outerR + flangeOverhang;
             auto make_flange = [&](double zBottom, double thickness, const char* ctx) -> TopoDS_Shape {
                 double holeHeight = thickness * 1.2;
                 double holeMargin = (holeHeight - thickness) / 2.0;
@@ -294,8 +302,8 @@ TopoDS_Shape BobbinBuilder::buildBobbin(const MAS::CoreBobbinProcessedDescriptio
         };
 
         if (hasFlanges) {
-            double flangeWidth = 2.0 * (colWidth + wwWidth);
-            double flangeDepth = 2.0 * (colDepth + wwWidth);
+            double flangeWidth = 2.0 * (colWidth + flangeOverhang);
+            double flangeDepth = 2.0 * (colDepth + flangeOverhang);
             // The engine has no flange corner radius. A rectangular flange keeps a
             // quarter of its smaller side: catalogue drawings of E bobbins show
             // rounded flanges, with no radius given.

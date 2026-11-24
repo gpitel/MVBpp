@@ -127,6 +127,7 @@
 
 namespace mvb {
 
+
 int curveSampleCount(double radius, double azSpan, double wireRadius) {
     double maxSag = samplingSag(wireRadius);
     double stepAz = (radius > 1e-12)
@@ -295,10 +296,17 @@ double primLength(const Primitive& p) {
                 if (dr != 0.0)
                     throw std::runtime_error("primLength: '" + p.label + "' is an eased climb on a "
                                              "varying radius, which has no construction");
-                const double B = 2.0 * std::abs(dy), C = daz * sp.r0;
-                if (B == 0.0) return C;
-                if (C == 0.0) return 0.5 * B;
-                return 0.5 * std::sqrt(B * B + C * C) + C * C / (2.0 * B) * std::asinh(B / C);
+                // ABT #2450: in general the slope runs linearly from Y0 = a |dy| to Y1 = (2 - a) |dy| per unit t
+                // (a = 2 - easeEndRate), and integral_0^1 sqrt(C^2 + Y(t)^2) dt = (F(Y1) - F(Y0)) / (Y1 - Y0) with
+                // F(v) = v/2 sqrt(C^2 + v^2) + C^2/2 asinh(v / C). easeEndRate = 0 is the form above (Y1 = 0).
+                const double C = daz * sp.r0;
+                const double Y0 = (2.0 - sp.easeEndRate) * dy, Y1 = sp.easeEndRate * dy;
+                if (Y1 == Y0) return std::sqrt(C * C + Y0 * Y0);
+                const auto F = [C](double v) {
+                    return C == 0.0 ? 0.5 * v * std::abs(v)
+                                    : 0.5 * v * std::sqrt(C * C + v * v) + 0.5 * C * C * std::asinh(v / C);
+                };
+                return (F(Y1) - F(Y0)) / (Y1 - Y0);
             }
             const double a = dr * dr + dy * dy;
             if (daz == 0.0) return std::sqrt(a);
@@ -767,9 +775,9 @@ TopoDS_Edge primEdge(const Primitive& pr, double wireRadius, double overA, doubl
                 const double sgn = (dAz >= 0.0) ? 1.0 : -1.0;
                 const double dvdu = (std::abs(dAz) > 1e-12) ? v1 / dAz : 0.0;
                 // An eased climb leaves at twice the mean slope and arrives level (ABT #1403).
-                const double dvduA = sp.levelOut ? 2.0 * dvdu
+                const double dvduA = sp.levelOut ? (2.0 - sp.easeEndRate) * dvdu
                                    : sp.easeIn > 0.0 ? 2.0 * dvdu / sp.easeIn : dvdu;
-                const double dvduB = (sp.levelOut || sp.easeIn > 0.0) ? 0.0 : dvdu;
+                const double dvduB = sp.levelOut ? sp.easeEndRate * dvdu : sp.easeIn > 0.0 ? 0.0 : dvdu;
                 const double dsduA = std::sqrt(sp.r0 * sp.r0 + dvduA * dvduA);
                 const double dsduB = std::sqrt(sp.r1 * sp.r1 + dvduB * dvduB);
                 const double az0e =
@@ -822,7 +830,9 @@ TopoDS_Edge primEdge(const Primitive& pr, double wireRadius, double overA, doubl
                         throw std::runtime_error(
                             "primEdge: '" + pr.label + "' is an eased climb on a varying radius, "
                             "which has no construction");
-                    const gp_Pnt2d q0(sp.az0, v0), q1(sp.az0 + 0.5 * dAz, v0 + dy),
+                    // ABT #2450: the middle pole stands where the end tangents cross, half-way in azimuth at the
+                    // start slope's height: v0 + (2 - easeEndRate) dy / 2 (v0 + dy when the piece arrives level).
+                    const gp_Pnt2d q0(sp.az0, v0), q1(sp.az0 + 0.5 * dAz, v0 + 0.5 * (2.0 - sp.easeEndRate) * dy),
                         q2(sp.az1, v0 + dy);
                     TColgp_Array1OfPnt2d poles(1, 3);
                     poles.SetValue(1, q0);
@@ -833,13 +843,14 @@ TopoDS_Edge primEdge(const Primitive& pr, double wireRadius, double overA, doubl
                     if (az0e != sp.az0 || az1e != sp.az1) {
                         Geom2dConvert_CompCurveToBSplineCurve cc(
                             Geom2dConvert::CurveToBSplineCurve(bez));
-                        const double slope0 = std::abs(dAz) > 1e-12 ? 2.0 * dy / dAz : 0.0;
+                        const double slope0 = std::abs(dAz) > 1e-12 ? (2.0 - sp.easeEndRate) * dy / dAz : 0.0;
+                        const double slope1 = std::abs(dAz) > 1e-12 ? sp.easeEndRate * dy / dAz : 0.0;
                         if (az0e != sp.az0 &&
                             !cc.Add(GCE2d_MakeSegment(gp_Pnt2d(az0e, v0 + (az0e - sp.az0) * slope0),
                                                       q0).Value(), 1e-12))
                             return TopoDS_Edge();
                         if (az1e != sp.az1 &&
-                            !cc.Add(GCE2d_MakeSegment(q2, gp_Pnt2d(az1e, v0 + dy)).Value(), 1e-12))
+                            !cc.Add(GCE2d_MakeSegment(q2, gp_Pnt2d(az1e, v0 + dy + (az1e - sp.az1) * slope1)).Value(), 1e-12))
                             return TopoDS_Edge();
                         pc = cc.BSplineCurve();
                     }
@@ -990,6 +1001,57 @@ TopoDS_Edge primEdge(const Primitive& pr, double wireRadius, double overA, doubl
     throw std::runtime_error(
         "WireAssembler: primEdge has no construction for primitive '" + pr.label +
         "' (unknown kind " + std::to_string(static_cast<int>(pr.kind)) + ")");
+}
+
+// A piece lies inside a host only on PROOF, from three measures that must agree: the piece's box lies within the host's,
+// every vertex of the piece classifies in or on the host, and what the piece keeps outside the host (a cut) is under a
+// hundredth of the piece. A cut alone is no proof: on 13_current_sense it came back EMPTY for a 2.1 mm dragback descent
+// against a 0.06 mm bend -- a boolean that failed quietly -- and the descent was dropped from the conductor, an open
+// circuit. The box and the vertices alone are no proof either: a bar whose ends sit in the two arms of a C lies in the
+// C's box with every vertex in copper, and crosses the opening. (No common: on the riser junctions this serves, OCC's
+// common returns empty for a piece that is inside; the ladder's own finding.)
+bool pieceLiesInside(const TopoDS_Shape& piece, double pieceVolume, const TopoDS_Shape& host) {
+    if (piece.IsNull() || host.IsNull() || !(pieceVolume > 0.0)) return false;
+    Bnd_Box bx, by;
+    BRepBndLib::AddOptimal(host, bx, /*useTriangulation=*/false, /*useShapeTolerance=*/false);
+    BRepBndLib::AddOptimal(piece, by, /*useTriangulation=*/false, /*useShapeTolerance=*/false);
+    if (bx.IsVoid() || by.IsVoid()) return false;
+    double x0, y0, z0, x1, y1, z1, u0, v0, w0, u1, v1, w1;
+    bx.Get(x0, y0, z0, x1, y1, z1);
+    by.Get(u0, v0, w0, u1, v1, w1);
+    const double slack = Precision::Confusion();   // the kernel's own resolution of a point
+    if (!(u0 >= x0 - slack && v0 >= y0 - slack && w0 >= z0 - slack && u1 <= x1 + slack && v1 <= y1 + slack &&
+          w1 <= z1 + slack))
+        return false;
+    try {
+        BRepClass3d_SolidClassifier in(host);
+        size_t vertices = 0;
+        for (TopExp_Explorer ex(piece, TopAbs_VERTEX); ex.More(); ex.Next(), ++vertices) {
+            in.Perform(BRep_Tool::Pnt(TopoDS::Vertex(ex.Current())), slack);
+            if (in.State() != TopAbs_IN && in.State() != TopAbs_ON) return false;
+        }
+        if (vertices == 0) return false;
+    } catch (const Standard_Failure&) {
+        return false;
+    }
+    for (double fuzzy : {0.0, 1e-7, 1e-6}) {
+        try {
+            BRepAlgoAPI_Cut cut;
+            TopTools_ListOfShape cargs, ctools;
+            cargs.Append(piece);
+            ctools.Append(host);
+            cut.SetArguments(cargs);
+            cut.SetTools(ctools);
+            if (fuzzy > 0) cut.SetFuzzyValue(fuzzy);
+            cut.Build();
+            if (!cut.IsDone() || cut.Shape().IsNull()) continue;
+            GProp_GProps outside;
+            BRepGProp::VolumeProperties(cut.Shape(), outside);
+            return outside.Mass() <= 0.01 * pieceVolume;
+        } catch (const Standard_Failure&) {
+        }
+    }
+    return false;
 }
 
 // Fuse all solids of a conductor's compound into as FEW bodies as possible, in ONE general
@@ -1475,7 +1537,16 @@ static TopoDS_Shape rawGrownSolid(const Primitive& pr, double r, double overA, d
         // 22 nm hole, and the metre revolve came out invalid with 0.0975 of its 0.1609 mm3. Revolved in the
         // millimetre frame and scaled back, the same bend is valid with its exact volume (measured standalone,
         // OCC 7.9.3; the horn torus, hole 0, likewise). So such a bend is revolved there and stays round.
-        const bool millimetreFrame = radius - r <= Precision::Confusion();
+        // A POLYGON'S REVOLVE IS BUILT THERE TOO (ABT #1278). In the metre frame OCC's revolve takes a profile edge
+        // that lies a few degrees off the bend axis for one parallel to it: its two ends stand a few micrometres
+        // apart in radius, the face comes out a CYLINDER instead of a cone, and the difference goes into the vertex
+        // tolerance. Measured standalone (OCC 7.9.3; a 12-gon of r = 50 um bent at 56.9 um, the edge 5 degrees off
+        // the axis): 2 cylinders, vertex tolerance 3.39 um, 0.38 % of the volume missing; in millimetres 12 cones,
+        // tolerance 1e-7, the exact volume. 13_current_sense's section phase crosses that window on its second
+        // layer (turns 24-28 and 35-38): the dragback bends there overlapped their own straight by 3.6e-6 mm3 and
+        // neither glued nor fused with it, which split the Secondary's weld and failed its mesh ("PLC Error").
+        const bool polygonRevolve = !profWire.IsNull();
+        const bool millimetreFrame = polygonRevolve || radius - r <= Precision::Confusion();
         gp_Trsf revolveUp, revolveDown;
         revolveUp.SetScale(gp_Pnt(0, 0, 0), 1000.0);
         revolveDown.SetScale(gp_Pnt(0, 0, 0), 1.0 / 1000.0);
@@ -1532,7 +1603,12 @@ static TopoDS_Shape rawGrownSolid(const Primitive& pr, double r, double overA, d
             *endCapOut = mp.Wire();
         }
         if (!rev.IsDone()) return TopoDS_Shape();
-        return millimetreFrame ? BRepBuilderAPI_Transform(rev.Shape(), revolveDown, Standard_True).Shape() : rev.Shape();
+        if (!millimetreFrame) return rev.Shape();
+        TopoDS_Shape metres = BRepBuilderAPI_Transform(rev.Shape(), revolveDown, Standard_True).Shape();
+        // The inverse scale divides the tolerances too (1e-10, below the kernel's own confusion): a faceted piece
+        // is glued to neighbours built at confusion, so it is raised back to it (as fromMitreFrame does).
+        if (polygonRevolve && !metres.IsNull()) ShapeFix_ShapeTolerance().LimitTolerance(metres, Precision::Confusion());
+        return metres;
     }
     // BLEND / SPIRAL: swept as exact pipes. A pipe has no revolve/extrude axis to overhang
     // along, so mitre growth EXTENDS THE SPINE instead: a short straight run along the analytic
@@ -3039,6 +3115,13 @@ size_t requireManifoldCopper(const TopoDS_Shape& shape, const std::string& condu
     return checked;
 }
 
+// The collision debug drawing reports a mitred corner that does not abut as a FINDING and keeps the copper as built
+// (set for the build by ConductorBuilder's diagnostic scope); a part refuses it.
+static thread_local bool tlsAbutmentFinding = false;
+void setAbutmentFinding(bool on) { tlsAbutmentFinding = on; }
+static thread_local bool tlsDisplayDrawing = false;
+void setDisplayDrawing(bool on) { tlsDisplayDrawing = on; }
+
 WeldMode weldModeFromEnv() {
     return std::getenv("MVB_WELD_ALL") != nullptr ? WeldMode::All : WeldMode::Auto;
 }
@@ -3090,7 +3173,9 @@ TopoDS_Shape assembleWire(const std::vector<const Primitive*>& ptrs, double wire
     std::vector<size_t> orig;
     for (size_t k = 0; k < ptrs.size(); ++k) {
         const Primitive& L = *ptrs[k];
-        const bool shortEase = L.kind == Primitive::SPIRAL && L.spiral.levelOut &&
+        // (An easing between two helices, easeEndRate != 0, has no level run to fold into: it is made one wire
+        // diameter long where it is drawn, ABT #2450.)
+        const bool shortEase = L.kind == Primitive::SPIRAL && L.spiral.levelOut && L.spiral.easeEndRate == 0.0 &&
                                !L.spiral.blend && primLength(L) < chord;
         if (!shortEase) {
             use.push_back(ptrs[k]);
@@ -3448,6 +3533,9 @@ static TopoDS_Shape assembleWireImpl(const std::vector<const Primitive*>& ptrs,
     // N-way glued fuse below; an overlapping (angS > 0) junction must stay on the general
     // boolean, where an intersection is what the algorithm is actually asked to compute.
     std::vector<bool> tangentToPrev;
+    // The junctions of a glued run that are EXACTLY tangent (shared caps): where a glued run comes back invalid it is
+    // cut at the others (see the glued fuse).
+    std::vector<bool> exactToPrev;
     // A joint sphere spans the junction it fills: half of it lies in the piece it is fused into
     // and half in the NEXT piece. Those two must therefore end up as ONE solid, or the sphere
     // simply becomes copper overlapping its own neighbour -- which is exactly what chunk 7
@@ -4266,7 +4354,16 @@ static TopoDS_Shape assembleWireImpl(const std::vector<const Primitive*>& ptrs,
             }
         }
         if (!prismDone) solid = parts.empty() ? TopoDS_Shape() : parts.front();
-        if (parts.size() > 1) {
+        if (parts.size() > 1 && tlsDisplayDrawing) {
+            // A display drawing is tessellated and looked at, never meshed: the halves of a closed revolution abut on
+            // one flush disc and are drawn as the two solids they are. Fusing them back, and measuring every piece to
+            // prove the fuse lost no copper, buys a drawing nothing (ABT #2489).
+            TopoDS_Compound halves;
+            BRep_Builder halvesBuilder;
+            halvesBuilder.MakeCompound(halves);
+            for (const auto& part : parts) halvesBuilder.Add(halves, part);
+            solid = halves;
+        } else if (parts.size() > 1) {
             // Fuse the halves back: both corners are cut, so the closed revolution is safe again.
             gp_Trsf up, down;
             up.SetScale(gp_Pnt(0, 0, 0), 1000.0);
@@ -4475,6 +4572,9 @@ static TopoDS_Shape assembleWireImpl(const std::vector<const Primitive*>& ptrs,
         const double tolPrevBefore = (tolDiag() && !prevBuilt.IsNull()) ? maxSubShapeTolerance(prevBuilt) : 0.0;
         if (i > 0 && (bentS || (exactTangent(angS) && dpS <= 1e-9))) {
             if (capsProvablyShared) ++abutChecked;   // verdict: shared face, zero lens, by construction
+            // ABT #2489 (Alf, 2026-11-24): a display drawing is a picture and its corners are not judged. The check is two
+            // booleans a corner, 71 % of a 200-turn drum's drawing (100 s with it, 29 s without).
+            else if (tlsDisplayDrawing) {}
             else checkMitredAbutment(prevBuilt, solid,
                                 std::string(bentS ? "" : "tangent ") + "'" + ptrs[i - 1]->label +
                                     "' -> '" + ptrs[i]->label + "'");
@@ -4588,6 +4688,7 @@ static TopoDS_Shape assembleWireImpl(const std::vector<const Primitive*>& ptrs,
         // A joint sphere genuinely interpenetrates both neighbours, so a run carrying one is
         // not glue-eligible either.
         tangentToPrev.push_back(i > 0 && !bentS && tangentAngle(angS) && !sphereAtPrevJunction);
+        exactToPrev.push_back(i > 0 && !bentS && exactTangent(angS) && !sphereAtPrevJunction);
         sphereAtPrevJunction = false;
         if (std::getenv("MVB_CAP_DEBUG"))
             std::cerr << "[cap-debug] junction " << i << " angS=" << angS << " bentS=" << bentS
@@ -4623,7 +4724,16 @@ static TopoDS_Shape assembleWireImpl(const std::vector<const Primitive*>& ptrs,
         // ABT #685: the same escape the certified enamel gate carries (MVB_ALLOW_ENAMEL) -- OFF by
         // default, so anything that ships is a design whose corners abut. Set it only to EXPORT a
         // known-faulty design for visual review; the fault is still printed in full.
-        if (std::getenv("MVB_ALLOW_ABUTMENT")) {
+        if (skipWeldIn) {
+            // A CUTTING TOOL (the bobbin cutter: the coated envelope, never shipped copper). Its pieces are united to
+            // cut, so two of them overlapping at a corner cut exactly what they cut abutting. 17_cllc's row bend
+            // (20 um of arc at the coated radius, cut as its two 10 um tangent straights) is such a corner: pieces
+            // shorter than their own mitre. Reported, not refused.
+            std::cerr << "[corners] cutting tool of " << conductorName << ": " << msg << "\n  (a tool's pieces are united; not refused)\n";
+        } else if (tlsAbutmentFinding) {
+            // The collision debug drawing (--skip-collision-check): drawn as built and reported, never a part.
+            std::cerr << "[ConductorBuilder] FINDING (corner drawn as built, not a part): " << msg << "\n";
+        } else if (std::getenv("MVB_ALLOW_ABUTMENT")) {
             std::cerr << "[corners] " << msg
                       << "\n  (MVB_ALLOW_ABUTMENT set: reported, not refused)\n";
         } else {
@@ -4844,139 +4954,262 @@ static TopoDS_Shape assembleWireImpl(const std::vector<const Primitive*>& ptrs,
                       << " tangent=" << nt << " keepLens=" << keepLens << "\n";
         }
         if (!keepLens && !noGlueFast) {
-            for (size_t s0 = 0; s0 < perPrimSolids.size();) {
-                // The glued fuse takes a TANGENT run: bridged pieces whose every junction is a
-                // shared cap. A run interrupted by one non-tangent junction used to go to the
-                // pairwise ladder whole -- every piece fused into the growing body, ~20 s a turn
-                // and ~2 min a five-piece round dragback, so 06_llc's 190-piece conductors (178
-                // tangent junctions, 12 not) took hours to weld. The run is now cut at its
-                // non-tangent junctions: each tangent stretch is glued in one fuse here, and the
-                // ladder below welds the stretches to each other across those few junctions.
-                size_t e0 = s0;
-                while (e0 + 1 < perPrimSolids.size() && e0 + 1 < bridgedToPrev.size() &&
-                       bridgedToPrev[e0 + 1] && e0 + 1 < tangentToPrev.size() &&
-                       tangentToPrev[e0 + 1])
-                    ++e0;
-                if (e0 > s0) {
-                    std::vector<TopoDS_Shape> gs;
-                    double sum = 0.0, mn = std::numeric_limits<double>::max();
-                    for (size_t k = s0; k <= e0; ++k) {
-                        gs.push_back(groupAt(k));
-                        GProp_GProps gp;
-                        BRepGProp::VolumeProperties(gs.back(), gp);
-                        sum += gp.Mass();
-                        mn = std::min(mn, gp.Mass());
-                    }
-                    const auto tGlue0 = std::chrono::steady_clock::now();
-                    // GlueFull first; when its result fails the acceptance below, GlueShift on the
-                    // same run under the SAME acceptance, before the pairwise ladder. GlueFull is
-                    // only correct where every junction's sub-shapes coincide fully, and a lens
-                    // the weld later finds at a fillet junction breaks that: on 11_pushpull it
-                    // dropped 0.026 mm3 (no two pieces overlap at all), the run fell to the
-                    // ladder, and the welded body failed the export's B-spline conversion -- two
-                    // conductors shipped as 2-3 separate solids (ABT #1528 regression from
-                    // fa5931b; 1405aa9 glued that run with GlueShift and fused it whole).
-                    for (int glueMode = 0; glueMode < 2 && !runFused.count(s0); ++glueMode)
-                    try {
-                        BRepAlgoAPI_Fuse fu;
-                        TopTools_ListOfShape fargs, ftools;
-                        fargs.Append(gs.front());
-                        for (size_t i2 = 1; i2 < gs.size(); ++i2) ftools.Append(gs[i2]);
-                        fu.SetArguments(fargs);
-                        fu.SetTools(ftools);
-                        // FULL glue, not Shift (ABT #1528). Every junction of a tangent run
-                        // is a shared cap -- a phase-continued polygon, or since the round
-                        // transitions an exact disc against a loft whose round end lies on the
-                        // same circle -- so its sub-shapes coincide FULLY, the input GlueFull is
-                        // specified for. GlueShift still intersects every edge with every face,
-                        // and a circle lying on a ruled B-spline boundary is where that costs:
-                        // PerformEF/IntCurveSurface ran > 25 min on one 267-piece 07_cmc run
-                        // (~20 s per round junction) and 283 s on one 20_iso run. Measured
-                        // GlueFull on the same runs: 7.5 s and 1.7 s, and the 20_iso result
-                        // census-identical to GlueShift (faces, thin faces, every conductor's
-                        // volume to 14 digits). The conservation test below is what makes the
-                        // stronger promise safe: a glue that drops or invents copper is refused.
-                        fu.SetGlue(glueMode == 0 ? BOPAlgo_GlueFull : BOPAlgo_GlueShift);
-                        fu.SetRunParallel(true);
-                        fu.Build();
-                        if (fu.IsDone() && !fu.Shape().IsNull() &&
-                            BRepCheck_Analyzer(fu.Shape()).IsValid()) {
-                            int ns = 0;
-                            for (TopExp_Explorer px(fu.Shape(), TopAbs_SOLID); px.More();
-                                 px.Next())
-                                ++ns;
-                            GProp_GProps gf;
-                            BRepGProp::VolumeProperties(fu.Shape(), gf);
-                            // ACCEPTANCE: ONE valid solid that neither invents copper (above
-                            // the sum) nor loses any piece (below). The one-solid requirement is
-                            // not fastidiousness -- it was RELAXED on 2026-09-19 to "strictly
-                            // fewer solids than pieces", on the reasoning that a run whose
-                            // chain is interrupted cannot become one body by any means, and
-                            // the measurement said otherwise: 02_flyback at --segments 12 went
-                            // from 28 solids / 20616 faces in 1632 s to 90 solids / 19254 faces
-                            // in 2076 s. Accepting a partially welded glued result PRE-EMPTS
-                            // the pairwise ladder, which welds those interrupted runs further
-                            // than one glued fuse does -- worse geometry AND slower. So: take
-                            // the glued fuse when it delivers the whole run as one body, and
-                            // otherwise let the ladder do its work.
-                            // A tangent run's pieces ABUT (shared caps, no bridging growth),
-                            // so the union must carry every piece: judged against the SMALLEST
-                            // one, because the failure mode loses a whole piece and a round
-                            // transition is one facet chord (the half-revolution fuse's rule).
-                            // Measured deficits: <= 3.4e-7 mm3 against smallest pieces of
-                            // >= 1.6e-3 mm3 (20_iso, 07_cmc, 10_emi).
-                            if (std::getenv("MVB_WELD_DEBUG"))
-                                std::cerr << "[glue-cons] run " << s0 << ".." << e0 << " sum="
-                                          << sum * 1e9 << " fused=" << gf.Mass() * 1e9
-                                          << " mm3, deficit=" << (sum - gf.Mass()) * 1e9
-                                          << " mm3, smallest=" << mn * 1e9 << " mm3\n";
-                            const bool conserves = sum - gf.Mass() <= 0.01 * mn;
-                            if (ns == 1 && conserves && gf.Mass() <= sum * (1.0 + 1e-3)) {
-                                runFused[s0] = {e0, fu.Shape()};
-                            } else {
-                                if (std::getenv("MVB_WELD_DEBUG")) {
-                                    // Which pieces overlap: every pair's common volume.
-                                    for (size_t a2 = 0; a2 < gs.size(); ++a2)
-                                        for (size_t b2 = a2 + 1; b2 < gs.size(); ++b2) {
-                                            BRepAlgoAPI_Common cm(gs[a2], gs[b2]);
-                                            if (!cm.IsDone()) continue;
-                                            GProp_GProps gc;
-                                            BRepGProp::VolumeProperties(cm.Shape(), gc);
-                                            if (gc.Mass() > 1e-15)
-                                                std::cerr << "[glue-overlap] run " << s0 << " pieces "
-                                                          << a2 << " & " << b2 << ": "
-                                                          << gc.Mass() * 1e9 << " mm3\n";
-                                        }
-                                }
-                                std::cerr << "[glue-fuse] run " << s0 << ".." << e0 << " ("
-                                          << gs.size() << " pieces) "
-                                          << (glueMode == 0 ? "GlueFull" : "GlueShift")
-                                          << " refused: solids=" << ns
-                                          << " fused=" << gf.Mass() * 1e9 << " sum=" << sum * 1e9
-                                          << " smallest=" << mn * 1e9 << " mm3; "
-                                          << (glueMode == 0 ? "retrying with GlueShift\n"
-                                                            : "welding it pairwise instead\n");
-                            }
-                        } else {
-                            std::cerr << "[glue-fuse] run " << s0 << ".." << e0 << " ("
-                                      << gs.size() << " pieces) gave no valid shape; welding it "
-                                         "pairwise instead\n";
-                        }
-                    } catch (const Standard_Failure& f) {
-                        std::cerr << "[glue-fuse] run " << s0 << ".." << e0 << " threw ("
-                                  << (f.GetMessageString() ? f.GetMessageString() : "(null)")
-                                  << "); welding it pairwise instead\n";
-                    }
-                    if (std::getenv("MVB_WELD_DEBUG"))
-                        std::cerr << "[weld-time] glued fuse of " << gs.size() << " pieces: "
-                                  << std::chrono::duration_cast<std::chrono::milliseconds>(
-                                         std::chrono::steady_clock::now() - tGlue0).count()
-                                  << " ms\n";
+            // THE GLUED FUSE AND WHAT IT CANNOT TAKE (ABT #1278, 2026-11-20).
+            // GlueFull welds pieces that meet on fully coincident faces and computes no intersection: a tangent run of
+            // hundreds of pieces in seconds. It is only correct on such pieces, and a conductor has a few places that
+            // are not: a junction that is tangent within the kernel's confusion but not exactly (bridged, so the two
+            // pieces overlap in a lens), pieces that overlap by construction (a dragback's straight that lies inside
+            // the bends beside it), and a piece far shorter than the wire is thick (13_current_sense, a 0.1 mm wire: a
+            // 0.64 um straight left between a dragback's fillet and its first bend; glued to either neighbour it loses
+            // 1e-6 mm3 of its 4.8e-6). One such place used to refuse the whole run -- 472 pieces on 13_current_sense
+            // -- and the run then went to the pairwise ladder, whose general fuse intersects each piece with every
+            // face of the body its box meets: a wound body meets itself turn against turn, and that weld ran past 2 h.
+            // So those places are welded WHERE THEY ARE, by a general fuse of the two small pieces that meet there,
+            // and everything else is glued:
+            //   1. the two pieces of every junction of a run that is not exactly tangent are fused generally first;
+            //   2. the run's arguments (pieces, and the pairs fused in 1) are glued in one GlueFull fuse;
+            //   3. refused, each adjacent pair of arguments is glued on its own, and every chain of arguments joined by
+            //      refused pairs is fused generally into one argument (the overlapping copper of one bend region);
+            //   4. the arguments are glued again; refused, they are halved and each half welded the same way, and the
+            //      two halves' facing bodies are glued to each other, or fused generally.
+            // Every fuse, glued or general, is taken only as ONE valid solid that conserves volume (below). What is
+            // still apart afterwards is left to the ladder, which glues first where the junction is a shared cap.
+            // GlueShift is no longer tried: over the whole corpus it never took a run GlueFull had refused, and on
+            // 13_current_sense it took over 25 min to refuse the 472-piece run GlueFull had refused in 44 s.
+            struct GlueArg {
+                size_t first = 0, last = 0;   // the pieces it holds
+                TopoDS_Shape shape;
+                double volume = 0.0;
+                double smallest = 0.0;        // its smallest piece's volume
+                double firstPiece = 0.0, lastPiece = 0.0;   // the volumes of its end pieces: what a junction at that end can lose
+            };
+            const auto volumeOf = [](const TopoDS_Shape& sh) {
+                GProp_GProps g;
+                BRepGProp::VolumeProperties(sh, g);
+                return g.Mass();
+            };
+            const auto solidsIn = [](const TopoDS_Shape& sh) {
+                int n = 0;
+                for (TopExp_Explorer px(sh, TopAbs_SOLID); px.More(); px.Next()) ++n;
+                return n;
+            };
+            size_t gluedFuses = 0, generalFuses = 0, refusedGlues = 0;
+            // The glued fuse of consecutive arguments, or a null argument.
+            // ACCEPTANCE: ONE valid solid that neither invents copper (above the sum) nor loses any piece (below). The
+            // one-solid requirement was RELAXED on 2026-09-19 to "strictly fewer solids than pieces" and measured
+            // worse: 02_flyback at --segments 12 went from 28 solids / 20616 faces in 1632 s to 90 solids / 19254
+            // faces in 2076 s. The pieces ABUT, so the union must carry every piece: judged against the SMALLEST one,
+            // because the failure mode loses a whole piece and a round transition is one facet chord. Measured
+            // deficits of good fuses: <= 3.4e-7 mm3 against smallest pieces of >= 1.6e-3 mm3 (20_iso, 07_cmc, 10_emi).
+            // FULL glue, not Shift (ABT #1528): GlueShift still intersects every edge with every face, and a circle
+            // lying on a ruled B-spline boundary is where that costs (> 25 min on one 267-piece 07_cmc run, 7.5 s
+            // with GlueFull, the results census-identical).
+            const auto glued = [&](const std::vector<GlueArg>& list) {
+                GlueArg out;
+                if (list.size() < 2) return out;
+                double sum = 0.0, mn = std::numeric_limits<double>::max();
+                for (const auto& g : list) {
+                    sum += g.volume;
+                    mn = std::min(mn, g.smallest);
                 }
-                s0 = e0 + 1;
+                // Two arguments have ONE junction between them, and only the two pieces that meet there can lose
+                // anything: the bound is theirs, the same a pair of bare pieces is judged by. (Judged by the smallest
+                // piece anywhere inside two glued bodies, a sound seam was refused for the loft noise of one junction
+                // against a hundredth of a 0.6 um sliver elsewhere, and went to a general fuse of two half coils.)
+                if (list.size() == 2) mn = std::min(list[0].lastPiece, list[1].firstPiece);
+                const auto t0 = std::chrono::steady_clock::now();
+                std::string how = "threw";
+                try {
+                    BRepAlgoAPI_Fuse fu;
+                    TopTools_ListOfShape fargs, ftools;
+                    fargs.Append(list.front().shape);
+                    for (size_t q = 1; q < list.size(); ++q) ftools.Append(list[q].shape);
+                    fu.SetArguments(fargs);
+                    fu.SetTools(ftools);
+                    fu.SetGlue(BOPAlgo_GlueFull);
+                    fu.SetRunParallel(true);
+                    fu.Build();
+                    if (!fu.IsDone() || fu.Shape().IsNull() || !BRepCheck_Analyzer(fu.Shape()).IsValid()) {
+                        how = "no valid shape";
+                    } else {
+                        const int ns = solidsIn(fu.Shape());
+                        const double v = volumeOf(fu.Shape());
+                        std::ostringstream m;
+                        m.precision(10);
+                        m << "solids=" << ns << " fused=" << v * 1e9 << " sum=" << sum * 1e9 << " smallest=" << mn * 1e9 << " mm3";
+                        how = m.str();
+                        // The loss bound is a hundredth of the smallest piece, and never below what the volume
+                        // integral itself resolves on the fused body (1e-6 of it: a 2.03 mm3 half of 13_current_sense's
+                        // Secondary glued to the other half read 6 digits equal and was refused against the 4.4e-8 mm3
+                        // that a hundredth of its 0.6 um sliver piece allows; one solid is what proves no piece is
+                        // missing, a gap would make two).
+                        if (ns == 1 && sum - v <= std::max(0.01 * mn, 1e-6 * sum) && v <= sum * (1.0 + 1e-3)) {
+                            out.first = list.front().first;
+                            out.last = list.back().last;
+                            out.shape = fu.Shape();
+                            out.volume = v;
+                            out.smallest = std::numeric_limits<double>::max();
+                            for (const auto& g : list) out.smallest = std::min(out.smallest, g.smallest);
+                            out.firstPiece = list.front().firstPiece;
+                            out.lastPiece = list.back().lastPiece;
+                        }
+                    }
+                } catch (const Standard_Failure&) {
+                }
+                if (out.shape.IsNull()) ++refusedGlues; else ++gluedFuses;
+                if (std::getenv("MVB_WELD_DEBUG") || (out.shape.IsNull() && list.size() > 2))
+                    std::cerr << "[glue-fuse] pieces " << list.front().first << ".." << list.back().last << " (" << list.size()
+                              << " arguments) " << (out.shape.IsNull() ? "refused" : "glued") << " (" << how << ") in "
+                              << std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count()
+                              << " ms\n";
+                return out;
+            };
+            // The general fuse of two arguments that meet, or a null argument. The ladder's own rungs and bounds: exact
+            // first, then the tolerant imprints, in both operand orders; a union is no smaller than its larger input
+            // and no larger than their sum (1e-3 of quadrature and imprint noise, measured on 10_emi).
+            const auto fusedGenerally = [&](const GlueArg& x, const GlueArg& y) {
+                GlueArg out;
+                for (bool swapped : {false, true})
+                    for (double fuzzy : {0.0, 1e-7, 1e-6}) {
+                        try {
+                            BRepAlgoAPI_Fuse fu;
+                            TopTools_ListOfShape fargs, ftools;
+                            fargs.Append(swapped ? y.shape : x.shape);
+                            ftools.Append(swapped ? x.shape : y.shape);
+                            fu.SetArguments(fargs);
+                            fu.SetTools(ftools);
+                            if (fuzzy > 0) fu.SetFuzzyValue(fuzzy);
+                            fu.Build();
+                            if (!fu.IsDone() || fu.Shape().IsNull() || !BRepCheck_Analyzer(fu.Shape()).IsValid()) continue;
+                            if (solidsIn(fu.Shape()) != 1) continue;
+                            const double v = volumeOf(fu.Shape());
+                            if (v > (x.volume + y.volume) * (1.0 + 1e-3) || v < std::max(x.volume, y.volume) * (1.0 - 1e-3)) continue;
+                            out.first = x.first;
+                            out.last = y.last;
+                            out.shape = fu.Shape();
+                            out.volume = v;
+                            out.smallest = std::min(x.smallest, y.smallest);
+                            out.firstPiece = x.firstPiece;
+                            out.lastPiece = y.lastPiece;
+                            ++generalFuses;
+                            if (std::getenv("MVB_WELD_DEBUG"))
+                                std::cerr << "[glue-fuse] pieces " << x.first << ".." << y.last << " fused generally ('"
+                                          << ptrs[x.last]->label << "' | '" << ptrs[y.first]->label << "')\n";
+                            return out;
+                        } catch (const Standard_Failure&) {
+                        }
+                    }
+                // A piece that lies ENTIRELY inside the argument before it (a dragback's straight between two bends at
+                // the wire's own radius; 4 of 5 10_emi bump risers): A u B = A when B is inside A, and OCC's fuse is
+                // sick on exactly these (the ladder's own finding). Absorbed only on pieceLiesInside's proof.
+                if (pieceLiesInside(y.shape, y.volume, x.shape)) {
+                    out = x;
+                    out.last = y.last;
+                    ++generalFuses;
+                    if (std::getenv("MVB_WELD_DEBUG"))
+                        std::cerr << "[glue-fuse] piece " << y.first << " ('" << ptrs[y.first]->label
+                                  << "') lies inside the pieces before it; absorbed\n";
+                    return out;
+                }
+                return out;
+            };
+            // Steps 3 and 4: the bodies a list of consecutive arguments welds into, in order.
+            std::function<std::vector<GlueArg>(std::vector<GlueArg>)> weldArguments = [&](std::vector<GlueArg> list) {
+                if (list.size() < 2) return list;
+                if (GlueArg whole = glued(list); !whole.shape.IsNull()) return std::vector<GlueArg>{whole};
+                if (list.size() == 2) {
+                    if (GlueArg pair = fusedGenerally(list[0], list[1]); !pair.shape.IsNull()) return std::vector<GlueArg>{pair};
+                    return list;
+                }
+                const size_t mid = list.size() / 2;
+                std::vector<GlueArg> lo = weldArguments(std::vector<GlueArg>(list.begin(), list.begin() + static_cast<std::ptrdiff_t>(mid)));
+                std::vector<GlueArg> hi = weldArguments(std::vector<GlueArg>(list.begin() + static_cast<std::ptrdiff_t>(mid), list.end()));
+                // The two halves' facing bodies: glued, and where that is refused (copper of one half overlaps copper of
+                // the other past the two pieces at the seam) fused generally.
+                GlueArg seam = glued({lo.back(), hi.front()});
+                if (seam.shape.IsNull()) seam = fusedGenerally(lo.back(), hi.front());
+                if (!seam.shape.IsNull()) {
+                    lo.back() = seam;
+                    lo.insert(lo.end(), hi.begin() + 1, hi.end());
+                    return lo;
+                }
+                lo.insert(lo.end(), hi.begin(), hi.end());
+                return lo;
+            };
+            // Step 2b, for a stretch its one glued fuse refused: each adjacent PAIR of arguments is glued on its own, and
+            // every chain of arguments joined by refused pairs is fused generally into one argument, piece after piece.
+            // That is where the overlapping copper is: a dragback's bends and the straights inside them, the risers of a
+            // wrap that rides over it. Such a chain is a few pieces of one bend region, so its general fuses are small.
+            const auto clustered = [&](const std::vector<GlueArg>& list) {
+                std::vector<GlueArg> out;
+                bool chain = false;   // the last argument of `out` is being grown by refused pairs
+                for (size_t q = 0; q < list.size(); ++q) {
+                    if (q == 0) {
+                        out.push_back(list[q]);
+                        continue;
+                    }
+                    const bool pairGlues = !glued({list[q - 1], list[q]}).shape.IsNull();
+                    if (pairGlues) {
+                        out.push_back(list[q]);
+                        chain = false;
+                        continue;
+                    }
+                    if (GlueArg grown = fusedGenerally(out.back(), list[q]); !grown.shape.IsNull()) {
+                        out.back() = grown;
+                        chain = true;
+                    } else {
+                        std::cerr << "[glue-fuse] pieces " << out.back().first << ".." << list[q].last << " neither glue nor fuse at '"
+                                  << ptrs[list[q].first]->label << "'; left to the ladder\n";
+                        out.push_back(list[q]);
+                        chain = false;
+                    }
+                }
+                (void) chain;
+                return out;
+            };
+            for (size_t runStart = 0; runStart < perPrimSolids.size();) {
+                // A run: bridged pieces whose every junction is tangent within the kernel's confusion (tangentAngle).
+                size_t runEnd = runStart;
+                while (runEnd + 1 < perPrimSolids.size() && runEnd + 1 < bridgedToPrev.size() &&
+                       bridgedToPrev[runEnd + 1] && runEnd + 1 < tangentToPrev.size() &&
+                       tangentToPrev[runEnd + 1])
+                    ++runEnd;
+                // Step 1. Its arguments: one per piece, and the two pieces of a junction that is not EXACTLY tangent
+                // fused generally into one. Where that fuse is refused the run is cut, as it always was.
+                std::vector<std::vector<GlueArg>> stretches(1);
+                for (size_t k = runStart; k <= runEnd; ++k) {
+                    GlueArg piece;
+                    piece.first = piece.last = k;
+                    piece.shape = groupAt(k);
+                    piece.volume = piece.smallest = piece.firstPiece = piece.lastPiece = volumeOf(piece.shape);
+                    const bool exact = k == runStart || (k < exactToPrev.size() && exactToPrev[k]);
+                    if (exact || stretches.back().empty()) {
+                        stretches.back().push_back(piece);
+                        continue;
+                    }
+                    if (GlueArg pair = fusedGenerally(stretches.back().back(), piece); !pair.shape.IsNull()) {
+                        stretches.back().back() = pair;
+                    } else {
+                        std::cerr << "[glue-fuse] the junction at piece " << k << " ('" << ptrs[k]->label << "') is not exactly "
+                                     "tangent and its two pieces do not fuse: the run " << runStart << ".." << runEnd << " is cut there\n";
+                        stretches.emplace_back();
+                        stretches.back().push_back(piece);
+                    }
+                }
+                for (auto& stretch : stretches) {
+                    std::vector<GlueArg> bodies;
+                    if (stretch.size() < 2) bodies = stretch;
+                    else if (GlueArg whole = glued(stretch); !whole.shape.IsNull()) bodies = {whole};
+                    else bodies = weldArguments(clustered(stretch));
+                    for (const GlueArg& body : bodies)
+                        if (body.last > body.first) runFused[body.first] = {body.last, body.shape};
+                }
+                runStart = runEnd + 1;
             }
-            if (std::getenv("MVB_WELD_DEBUG"))
-                std::cerr << "[weld-stats] glued runs=" << runFused.size() << "\n";
+            if (std::getenv("MVB_WELD_DEBUG") || refusedGlues > 0)
+                std::cerr << "[glue-fuse] " << conductorName << ": " << perPrimSolids.size() << " pieces welded into "
+                          << runFused.size() << " glued bod" << (runFused.size() == 1 ? "y" : "ies") << " by " << gluedFuses
+                          << " glued and " << generalFuses << " general fuse(s); " << refusedGlues << " glued fuse(s) refused\n";
         }
         // ---------------------------------------------------------------------------------
         // A glued run that continues the body (its first junction bridged to the piece before)
@@ -5032,6 +5265,53 @@ static TopoDS_Shape assembleWireImpl(const std::vector<const Primitive*>& ptrs,
                 continue;
             }
             bool welded = false;
+            // THE GLUED RUNG. Where this junction is a shared cap (exactly tangent: the two pieces abut on one face
+            // and overlap nowhere), the body and the incoming group -- a single piece, or a whole run glued above --
+            // are joined by a GLUED fuse first: OCC then looks for coincident sub-shapes only and computes no
+            // intersection. The general fuse of the rungs below intersects every face of the group with every face
+            // of the body whose boxes meet, and a wound body meets itself turn against turn: that is what made the
+            // ladder crawl (13_current_sense, 472 pieces, past 2 h). Same acceptance as a glued run: one valid solid
+            // that invents no copper and loses less than a hundredth of the smaller of the two pieces at the junction
+            // or of any piece of the group. Refused, the junction goes on to the rungs below unchanged.
+            if (!noGlueFast && k >= 1 && k < exactToPrev.size() && exactToPrev[k]) {
+                try {
+                    const auto tRung0 = std::chrono::steady_clock::now();
+                    double mn = std::numeric_limits<double>::max();
+                    const size_t groupEnd = gluedRunEnd != std::numeric_limits<size_t>::max() ? gluedRunEnd : k;
+                    for (size_t q = k - 1; q <= groupEnd; ++q) {
+                        GProp_GProps gq;
+                        BRepGProp::VolumeProperties(groupAt(q), gq);
+                        mn = std::min(mn, gq.Mass());
+                    }
+                    BRepAlgoAPI_Fuse fu;
+                    TopTools_ListOfShape fargs, ftools;
+                    fargs.Append(acc);
+                    ftools.Append(group);
+                    fu.SetArguments(fargs);
+                    fu.SetTools(ftools);
+                    fu.SetGlue(BOPAlgo_GlueFull);
+                    fu.SetRunParallel(true);
+                    fu.Build();
+                    if (fu.IsDone() && !fu.Shape().IsNull() && BRepCheck_Analyzer(fu.Shape()).IsValid()) {
+                        int ns = 0;
+                        for (TopExp_Explorer px(fu.Shape(), TopAbs_SOLID); px.More(); px.Next()) ++ns;
+                        GProp_GProps gf;
+                        BRepGProp::VolumeProperties(fu.Shape(), gf);
+                        const double sum = accVol + groupVol;
+                        if (ns == 1 && sum - gf.Mass() <= 0.01 * mn && gf.Mass() <= sum * (1.0 + 1e-3)) {
+                            acc = fu.Shape();
+                            accVol = gf.Mass();
+                            welded = true;
+                            accPieces.push_back(group);   // undo material for the flush gate
+                        }
+                    }
+                    if (std::getenv("MVB_WELD_DEBUG"))
+                        std::cerr << "[weld-time] glued rung at piece " << k << ".." << groupEnd << (welded ? " welded" : " refused")
+                                  << ": " << std::chrono::duration_cast<std::chrono::milliseconds>(
+                                         std::chrono::steady_clock::now() - tRung0).count() << " ms\n";
+                } catch (const Standard_Failure&) {
+                }
+            }
             // TOLERANT-IMPRINT LADDER. Standard assembly-meshing practice (Sandia/Coreform Cubit,
             // "Resolving Problems with Conformal Assemblies") is imprint-and-merge, falling back
             // to a TOLERANT imprint when the exact one fails on sub-tolerance discrepancies --
@@ -5042,9 +5322,15 @@ static TopoDS_Shape assembleWireImpl(const std::vector<const Primitive*>& ptrs,
             // fusing a 4%-of-chain bump riser as the TOOL onto the accumulated chain drops the
             // accumulator at fuzzy=0 (result = the riser alone) and invents +0.29% volume at
             // fuzzy=1e-7 -- an operand-order pathology in the boolean, not a geometry fault.
+            // A whole glued body that would not glue to the body before it is NOT fused generally to it: the junction is
+            // the one place the glued weld could not take (its two pieces neither glue nor fuse on their own), and the
+            // general fuse of two wound bodies there is the hours this weld existed to avoid (13_current_sense: the
+            // Secondary's two halves at a dragback bend). It goes straight to the trim below: the lens is cut off
+            // against the piece before it and the two bodies abut.
+            const bool wholeBody = !gluedRun.IsNull();
             for (bool swapped : {false, true}) {
             for (double fuzzy : {0.0, 1e-7, 1e-6}) {
-            if (welded) break;
+            if (welded || wholeBody) break;
             try {
                 BRepAlgoAPI_Fuse fu;
                 TopTools_ListOfShape fargs, ftools;

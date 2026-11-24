@@ -41,6 +41,8 @@
 #include <gp_Circ.hxx>
 #include <gp_Torus.hxx>
 #include "mvb/WireAssembler.h"
+#include <BRepAlgoAPI_Cut.hxx>
+#include <BRepPrimAPI_MakeSphere.hxx>
 #include "mvb/PortPlane.h"
 #include "mvb/NamedShape.h"
 #include <gp_Dir.hxx>
@@ -368,6 +370,45 @@ TEST_CASE("Real winding: an interleaved N-filar design builds CERTIFIED CLEAR (c
     // The gate is the assertion: it throws on any bare-copper overlap, so a clean build IS the
     // contract. Nothing is relaxed here -- see ABT #839, the gate is never weakened to pass.
     REQUIRE_NOTHROW(builder.drawMagnetic(enriched, outputPath(""), cfg));
+}
+
+// ABT #2489 (the web's 3D viewer, which draws the wire at its outer diameter): on this E 16/12/5 design the Primary's
+// first turn rejoins its climb through a slope change of 0.61 degrees, rounded at MKF's wire bend radius. A wire drawn at
+// its outer diameter cannot be swept round that bend, so the display drawing draws it as the corner of its tangent
+// straights; its pieces must not share copper there. (1.0.5 refused the drawing over two 2 um straights whose corner did
+// not abut; 1.0.6 left the kink unrounded and butted, 0.00039 mm^3 shared.) The fixture is the `magnetic` of WebFrontend
+// tests/fixtures/e16_contiguous_two_windings.json, unchanged.
+TEST_CASE("Real winding drawn at the outer diameter: no two consecutive pieces share copper at a slight row kink (e16 contiguous, ABT #2489)",
+          "[realwinding][abt2489]") {
+    auto magneticJson = loadFixture("abt2489_e16_contiguous_two_windings.json");
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+    mvb::MagneticBuilder builder;
+    mvb::DrawConfig cfg{"step", /*includeBobbin=*/true, /*scale=*/1.0, /*symmetryPlanes=*/0};
+    cfg.useRealWindingGeometry = true;
+    cfg.paintCoating = false;   // the copper, judged by the gate: its row bend stays round
+    REQUIRE_NOTHROW(builder.drawMagnetic(enriched, outputPath(""), cfg));
+    // The display drawing is not judged by the assembler (ABT #2489, 2026-11-24), so it is measured here: no two
+    // consecutive pieces of the Primary share a volume, by the measure the assembler applies to copper (1e-6 mm^3).
+    const auto named = builder.buildAllNamed(enriched, /*includeBobbin=*/true, /*symmetryPlanes=*/0,
+                                             mvb::DEFAULT_WIRE_POLYGON_SEGMENTS, mvb::DEFAULT_CORE_POLYGON_SEGMENTS,
+                                             /*paintCoating=*/true, /*emitCoatingShells=*/false,
+                                             /*includeInsulation=*/false, /*coreCoatingThickness=*/0.0,
+                                             /*useRealWindingGeometry=*/true, /*femReady=*/false);
+    gp_Trsf toMm;
+    toMm.SetScale(gp_Pnt(0, 0, 0), 1000.0);
+    int pairs = 0;
+    for (const auto& ns : named) {
+        if (ns.name != "Primary parallel 0") continue;
+        std::vector<TopoDS_Shape> pieces;
+        for (TopExp_Explorer ex(ns.shape, TopAbs_SOLID); ex.More(); ex.Next())
+            pieces.push_back(BRepBuilderAPI_Transform(ex.Current(), toMm).Shape());
+        REQUIRE(pieces.size() == ns.partNames.size());
+        for (size_t k = 0; k + 1 < pieces.size(); ++k, ++pairs) {
+            INFO("'" << ns.partNames[k] << "' -> '" << ns.partNames[k + 1] << "'");
+            CHECK(commonVolume(pieces[k], pieces[k + 1]) <= 1e-6);
+        }
+    }
+    CHECK(pairs > 10);
 }
 
 TEST_CASE("Real winding: rect-column conductor fuses into ONE connected solid",
@@ -2443,6 +2484,8 @@ TEST_CASE("Real winding: no junction is bridged at a nonzero angle -- isolated b
     const auto paths = builder.buildRealWindingPaths(enriched);
     REQUIRE_FALSE(paths.empty());
     size_t junctions = 0, spiralArc = 0, kinkedBridges = 0;
+    std::ostringstream kinked;
+    kinked.precision(9);
     for (const auto& path : paths) {
         for (const auto& j : path.junctions) {
             ++junctions;
@@ -2451,8 +2494,8 @@ TEST_CASE("Real winding: no junction is bridged at a nonzero angle -- isolated b
             if (sa) ++spiralArc;
             if (j.verdict == mvb::JunctionVerdict::Bridge && j.angle > mvb::kTangentJunctionAngle) {
                 ++kinkedBridges;
-                UNSCOPED_INFO(path.name << ": '" << j.fromLabel << "' -> '" << j.toLabel << "' bridged at "
-                                        << j.angle * 180.0 / std::numbers::pi << " deg");
+                kinked << "\n  " << path.name << ": '" << j.fromLabel << "' -> '" << j.toLabel << "' bridged at "
+                       << j.angle * 180.0 / std::numbers::pi << " deg";
             }
         }
     }
@@ -2460,6 +2503,8 @@ TEST_CASE("Real winding: no junction is bridged at a nonzero angle -- isolated b
     // level runs past the stations are arcs).
     REQUIRE(junctions > 0);
     REQUIRE(spiralArc > 0);
+    // (Listed here, on the assertion they belong to: an UNSCOPED_INFO in the loop was consumed by the REQUIREs above.)
+    INFO("kinked bridged junctions:" << kinked.str());
     CHECK(kinkedBridges == 0);
 }
 
@@ -2492,6 +2537,172 @@ TEST_CASE("Assembler: a kinked SPIRAL->ARC3 bridge is refused, not welded (ABT #
     REQUIRE_THROWS_WITH(mvb::assembleWire(chain, rw, 12, mvb::CornerStyle::BisectionMitre, nullptr,
                                           false, "test conductor"),
                         Catch::Matchers::ContainsSubstring("refusing to bridge and weld"));
+}
+
+// ABT #1278 (13_current_sense, a 0.1 mm wire bent at 56.9 um). A faceted bend is the wire's 12-gon revolved about
+// the bend axis. In the metre frame OCC's revolve took a polygon edge lying a few degrees off that axis for one
+// parallel to it and made a CYLINDER of it instead of a cone: 3.4 um of vertex tolerance and 0.38 % of the bend's
+// volume gone, at the section phases 13_current_sense reaches on its second layer -- where the dragback's bends then
+// neither glued nor fused with the straight between them, the Secondary's weld split and its mesh failed. The bend is
+// built here at every section phase a 12-gon has (the bend axis turned in 2.5-degree steps through one facet), between
+// two straights, welded: one valid solid of exactly the swept volume, no vertex looser than the model's resolution.
+TEST_CASE("Assembler: a faceted bend is revolved exactly at every phase of its section to the bend axis (ABT #1278)",
+          "[realwinding][abt1278]") {
+    ScopedEnv1403 weld("MVB_WELD_ALL", "1");
+    const double rw = 50e-6, bend = 56.890675e-6, leg = 400e-6;
+    const int segments = 12;
+    int built = 0;
+    for (int step = 0; step < 12; ++step) {
+        const double phi = step * 2.5 * std::numbers::pi / 180.0;
+        const gp_XYZ axis(std::cos(phi), std::sin(phi), 0.0);
+        const gp_XYZ dIn(0.0, 0.0, 1.0);
+        const gp_XYZ dOut = axis.Crossed(dIn);   // the travel direction a quarter turn about `axis` later
+        const gp_Pnt bendStart(0.0, 0.0, 0.0);
+        mvb::Primitive in;
+        in.kind = mvb::Primitive::SEG;
+        in.seg = {gp_Pnt(bendStart.XYZ() - dIn * leg), bendStart};
+        in.label = "test straight in";
+        mvb::Primitive arc;
+        arc.kind = mvb::Primitive::ARC3;
+        arc.arc.c = gp_Pnt(bendStart.XYZ() + dOut * bend);
+        arc.arc.axis = axis;
+        arc.arc.v0 = bendStart.XYZ() - arc.arc.c.XYZ();
+        arc.arc.sweep = std::numbers::pi / 2.0;
+        arc.label = "test bend";
+        const gp_Pnt bendEnd(arc.arc.c.XYZ() + dIn * bend);
+        mvb::Primitive out;
+        out.kind = mvb::Primitive::SEG;
+        out.seg = {bendEnd, gp_Pnt(bendEnd.XYZ() + dOut * leg)};
+        out.label = "test straight out";
+        const std::vector<const mvb::Primitive*> chain{&in, &arc, &out};
+        const TopoDS_Shape wire = mvb::assembleWire(chain, rw, segments, mvb::CornerStyle::BisectionMitre, nullptr, false,
+                                                    "test conductor");
+        INFO("bend axis " << step * 2.5 << " deg from world x");
+        REQUIRE_FALSE(wire.IsNull());
+        CHECK(BRepCheck_Analyzer(wire).IsValid());
+        int solids = 0;
+        for (TopExp_Explorer e(wire, TopAbs_SOLID); e.More(); e.Next()) ++solids;
+        CHECK(solids == 1);
+        GProp_GProps props;
+        BRepGProp::VolumeProperties(wire, props);
+        // a regular 12-gon inscribed in the wire's circle, carried along the centreline (Pappus for the bend)
+        const double section = 0.5 * segments * rw * rw * std::sin(2.0 * std::numbers::pi / segments);
+        const double exact = section * (2.0 * leg + bend * std::numbers::pi / 2.0);
+        INFO("volume " << props.Mass() << " m3, exact " << exact << " m3");
+        CHECK(std::abs(props.Mass() - exact) <= 1e-6 * exact);
+        double worst = 0.0;
+        for (TopExp_Explorer e(wire, TopAbs_VERTEX); e.More(); e.Next())
+            worst = std::max(worst, BRep_Tool::Tolerance(TopoDS::Vertex(e.Current())));
+        INFO("loosest vertex " << worst << " m; Precision::Confusion() = " << Precision::Confusion() << " m");
+        CHECK(worst <= Precision::Confusion() * (1.0 + 1e-9));
+        ++built;
+    }
+    REQUIRE(built == 12);
+}
+
+// ABT #1278. A layer change's radial step of one wire diameter, bent at half a diameter at both ends, is all bend: on
+// a flat face its two bends would meet. On the wrap's circle the end fillet stops the circle's sagitta short, and that
+// residue used to stand as a straight between the two bends -- 0.59 to 0.69 um long on 13_current_sense's four layer
+// changes, shorter than the mesher's own snapping distance. The step's corner now starts where the end fillet stops,
+// so the fillet hands over to a bend, never to a straight, at both ends of every layer change.
+TEST_CASE("Real winding: a layer change that is all bend has no straight between its end fillet and its corner -- "
+          "13_current_sense (ABT #1278)",
+          "[realwinding][abt1278]") {
+    std::ifstream f(std::string(MAS_EXAMPLES_DIR) + "/13_current_sense_er95_n87.json");
+    REQUIRE(f.good());
+    json j = json::parse(f);
+    auto magneticJson = j.contains("magnetic") ? j.at("magnetic") : j;
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+    mvb::MagneticBuilder builder;
+    const auto paths = builder.buildRealWindingPaths(enriched);
+    REQUIRE_FALSE(paths.empty());
+    const auto ofDragback = [](const std::string& label) { return label.find("(dragback) ") != std::string::npos; };
+    const auto wrapFillet = [&](const std::string& label) {
+        return label.find("fillet arc") != std::string::npos && !ofDragback(label);
+    };
+    size_t starts = 0, ends = 0, straightStarts = 0, straightEnds = 0;
+    std::ostringstream straights;
+    for (const auto& path : paths)
+        for (const auto& jn : path.junctions) {
+            if (wrapFillet(jn.fromLabel) && ofDragback(jn.toLabel)) {
+                ++starts;
+                if (jn.toKind != mvb::Primitive::ARC3) {
+                    ++straightStarts;
+                    straights << "\n  " << path.name << ": '" << jn.fromLabel << "' -> '" << jn.toLabel << "'";
+                }
+            }
+            if (ofDragback(jn.fromLabel) && wrapFillet(jn.toLabel)) {
+                ++ends;
+                if (jn.fromKind != mvb::Primitive::ARC3) {
+                    ++straightEnds;
+                    straights << "\n  " << path.name << ": '" << jn.fromLabel << "' -> '" << jn.toLabel << "'";
+                }
+            }
+        }
+    // The filter matched: the Secondary's 80 turns lie in five layers, four layer changes, each with both ends.
+    REQUIRE(starts == 4);
+    REQUIRE(ends == 4);
+    INFO("end fillets meeting a straight:" << straights.str());
+    CHECK(straightStarts == 0);
+    CHECK(straightEnds == 0);
+}
+
+// ABT #2474. 06_llc's Primary changes layer five times per parallel, each by a radial step of one wire diameter out and
+// one ride over a wire back in, bent at half a diameter at both ends. At exactly MKF's radius the fillet on the wrap's
+// circle and the step's corner left 3.2 - 7.9 um of straight between them (10 micron-long solids per parallel in the
+// STEP, and the mesh's shortest edges): the circle's sagitta over one bend, plus, on the lanes the next layer's ride was
+// not sized for, that ride's excess. Shorter than the wire's coating (17 um), such a straight is no straight: the two
+// bends share one radius, 0.6 - 1.5 % above MKF's, at which they meet.
+TEST_CASE("Real winding: the two bends of a one-diameter layer step share the radius at which they meet -- 06_llc "
+          "(ABT #2474)",
+          "[realwinding][abt2474]") {
+    std::ifstream f(std::string(MAS_EXAMPLES_DIR) + "/06_llc_xfmr_eq4128_3c97.json");
+    REQUIRE(f.good());
+    json j = json::parse(f);
+    auto magneticJson = j.contains("magnetic") ? j.at("magnetic") : j;
+    auto enriched = mvb::magnetic_autocomplete_safe(magneticJson, /*useRealWindingGeometry=*/true);
+    mvb::MagneticBuilder builder;
+    const auto paths = builder.buildRealWindingPaths(enriched);
+    REQUIRE_FALSE(paths.empty());
+    const auto ofDragback = [](const std::string& label) { return label.find("(dragback) ") != std::string::npos; };
+    const auto wrapFillet = [&](const std::string& label, int kind) {
+        return kind == mvb::Primitive::ARC3 && label.find("fillet") != std::string::npos && !ofDragback(label);
+    };
+    const auto stepBend = [&](const std::string& label, int kind) {
+        return kind == mvb::Primitive::ARC3 && label.find("(dragback) bend") != std::string::npos;
+    };
+    size_t steps = 0, withStraight = 0;
+    double least = std::numeric_limits<double>::max(), most = 0.0, widestMismatch = 0.0, mkf = 0.0;
+    std::ostringstream straights;
+    for (const auto& path : paths) {
+        if (path.name.rfind("Primary", 0) != 0) continue;
+        for (const auto& jn : path.junctions) {
+            // a step's two bends in travel order: fillet then bend (stepping out), or bend then fillet (stepping in)
+            const bool out = wrapFillet(jn.fromLabel, jn.fromKind) && ofDragback(jn.toLabel);
+            const bool in = ofDragback(jn.fromLabel) && wrapFillet(jn.toLabel, jn.toKind);
+            if (!out && !in) continue;
+            ++steps;
+            if (!(out ? stepBend(jn.toLabel, jn.toKind) : stepBend(jn.fromLabel, jn.fromKind))) {
+                ++withStraight;
+                straights << "\n  " << path.name << ": '" << jn.fromLabel << "' -> '" << jn.toLabel << "'";
+                continue;
+            }
+            least = std::min({least, jn.fromArcRadius, jn.toArcRadius});
+            most = std::max({most, jn.fromArcRadius, jn.toArcRadius});
+            widestMismatch = std::max(widestMismatch, std::abs(jn.fromArcRadius - jn.toArcRadius));
+        }
+        mkf = path.wireRadius;
+    }
+    // The filter matched: three parallels, five layer changes each, a step out and a step in per change.
+    REQUIRE(steps == 30);
+    INFO("steps whose fillet meets a straight:" << straights.str());
+    CHECK(withStraight == 0);
+    // One radius per step (the solve closes to 1e-14 m), above the copper's own radius, and all thirty within 2 % of
+    // each other (measured 0.268628 to 0.270973 mm against MKF's 0.267).
+    INFO("bend radii from " << least * 1e3 << " to " << most * 1e3 << " mm; widest fillet/corner mismatch " << widestMismatch * 1e9 << " nm");
+    CHECK(widestMismatch < 1e-11);
+    CHECK(least > mkf);
+    CHECK(most < 1.02 * least);
 }
 
 // The manifold gate, on shapes whose defect is certain by construction: a solid holding the same
@@ -2760,4 +2971,64 @@ TEST_CASE("Draw-time lead routes are MKF's real-winding plan", "[realwinding][le
     CHECK(routesUnder(std::nullopt) == realPlan);
     // The policy restores the caller's setting when it ends.
     CHECK_FALSE(settings.get_coil_use_real_winding_geometry());
+}
+
+// The assembler's general fuse may leave a piece out of the boolean when the piece lies entirely inside the copper before
+// it (A u B = A). That is only safe on proof. On 13_current_sense (ABT #1278) a cut that came back EMPTY was taken as the
+// proof for a 2.1 mm dragback descent against a 0.06 mm bend, and the descent vanished from the conductor: an open circuit
+// in a STEP that still looked whole from the outside. mvb::pieceLiesInside asks three measures to agree (box, vertices,
+// cut). The cut is the only measure a healthy boolean needs -- the bar across the C below is caught by nothing else -- and
+// the box and the vertices are what stands when the boolean is the thing that failed.
+TEST_CASE("Assembler: a piece is absorbed only when it is proven to lie inside the copper before it (ABT #1278)",
+          "[realwinding][absorb]") {
+    const double mm = 1e-3;
+    const auto box = [&](double x0, double y0, double z0, double x1, double y1, double z1) -> TopoDS_Shape {
+        return BRepPrimAPI_MakeBox(gp_Pnt(x0 * mm, y0 * mm, z0 * mm), gp_Pnt(x1 * mm, y1 * mm, z1 * mm)).Shape();
+    };
+    const auto volumeOf = [](const TopoDS_Shape& sh) {
+        GProp_GProps g;
+        BRepGProp::VolumeProperties(sh, g);
+        return g.Mass();
+    };
+    const auto inside = [&](const TopoDS_Shape& piece, const TopoDS_Shape& host) {
+        return mvb::pieceLiesInside(piece, volumeOf(piece), host);
+    };
+    const TopoDS_Shape slab = box(0, 0, 0, 3, 3, 1);
+
+    SECTION("a piece strictly inside is inside") { CHECK(inside(box(1, 1, 0.25, 2, 2, 0.75), slab)); }
+    SECTION("a piece flush with the host's faces is inside") { CHECK(inside(box(0, 0, 0, 1, 1, 1), slab)); }
+    SECTION("the host is inside itself") { CHECK(inside(slab, slab)); }
+    SECTION("a long piece through a small host is not inside it") {
+        // the sizes of 13_current_sense's case: a 2.1 mm descent of a 0.1 mm wire, a bend 0.12 mm across
+        const TopoDS_Shape bend = box(0, 0, 0, 0.12, 0.12, 0.12);
+        const TopoDS_Shape descent = box(-2.1, 0.01, 0.01, 0.06, 0.11, 0.11);
+        CHECK_FALSE(inside(descent, bend));
+        CHECK(volumeOf(descent) > 10.0 * volumeOf(bend));   // the fixture is the case: the piece dwarfs its host
+    }
+    SECTION("a piece within the host's box with a corner in the open is not inside") {
+        const TopoDS_Shape ball = BRepPrimAPI_MakeSphere(gp_Pnt(0, 0, 0), 1.0 * mm).Shape();
+        CHECK_FALSE(inside(box(0.6, 0.6, 0.6, 0.7, 0.7, 0.7), ball));   // far corner 1.21 mm from the centre
+        CHECK(inside(box(0.3, 0.3, 0.3, 0.5, 0.5, 0.5), ball));         // far corner 0.87 mm from the centre
+    }
+    SECTION("a bar across the opening of a C is not inside the C, though its box and every vertex are") {
+        BRepAlgoAPI_Cut notch(slab, box(1, 1, 0, 2, 3, 1));
+        REQUIRE(notch.IsDone());
+        const TopoDS_Shape c = notch.Shape();
+        REQUIRE(volumeOf(c) == Catch::Approx(7.0 * mm * mm * mm).epsilon(1e-9));
+        const TopoDS_Shape bar = box(0.5, 2, 0.25, 2.5, 2.5, 0.75);   // ends in the two arms, middle over the opening
+        size_t vertices = 0;
+        BRepClass3d_SolidClassifier in(c);
+        for (TopExp_Explorer ex(bar, TopAbs_VERTEX); ex.More(); ex.Next(), ++vertices) {
+            in.Perform(BRep_Tool::Pnt(TopoDS::Vertex(ex.Current())), Precision::Confusion());
+            CHECK(in.State() == TopAbs_IN);
+        }
+        REQUIRE(vertices > 0);
+        CHECK_FALSE(inside(bar, c));
+        CHECK(inside(box(0.25, 2, 0.25, 0.75, 2.5, 0.75), c));   // the same bar cut down to one arm
+    }
+    SECTION("nothing is proven about a null shape or a piece of no volume") {
+        CHECK_FALSE(mvb::pieceLiesInside(TopoDS_Shape(), 1.0, slab));
+        CHECK_FALSE(mvb::pieceLiesInside(box(1, 1, 0.25, 2, 2, 0.75), 1.0, TopoDS_Shape()));
+        CHECK_FALSE(mvb::pieceLiesInside(box(1, 1, 0.25, 2, 2, 0.75), 0.0, slab));
+    }
 }

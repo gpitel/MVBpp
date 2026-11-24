@@ -24,6 +24,61 @@ namespace mvb::mesh {
 namespace gf = gmsh::model::mesh::field;
 namespace go = gmsh::option;
 
+double wire_scale_target(double surface_radius) {
+    if (!(surface_radius > 0.0)) throw std::invalid_argument("wire_scale_target: the surface radius must be > 0");
+    return 1.2 * surface_radius;
+}
+
+double foil_scale_target(double thickness) {
+    if (!(thickness > 0.0)) throw std::invalid_argument("foil_scale_target: the foil thickness must be > 0");
+    return 2.0 * thickness;
+}
+
+std::optional<std::string> winding_of_conductor_region(const std::string& region) {
+    if (region.rfind("winding_", 0) == 0) return region.substr(8);
+    if (region.rfind("turn_", 0) == 0) {
+        const auto last = region.rfind('_');
+        if (last > 5) return region.substr(5, last - 5);
+    }
+    return std::nullopt;
+}
+
+std::map<std::string, double> automatic_conductor_targets(const std::vector<std::string>& conductor_regions,
+                                                          const std::map<std::string, double>& wire_target_by_winding) {
+    std::map<std::string, double> targets;
+    for (const auto& region : conductor_regions) {
+        const auto winding = winding_of_conductor_region(region);
+        if (!winding) continue;
+        const auto it = wire_target_by_winding.find(*winding);
+        if (it == wire_target_by_winding.end())
+            throw std::runtime_error("mesh sizing: conductor region '" + region + "' belongs to no winding of the coil's "
+                                     "functional description; it has no wire to be sized from");
+        targets["winding_" + *winding] = it->second;
+    }
+    return targets;
+}
+
+bool corridor_binds(double bound, double target_a, double target_b) { return bound < std::max(target_a, target_b); }
+
+double chord_bound(double radius, double gap) {
+    if (!(radius > 0.0)) throw std::invalid_argument("chord_bound: the radius of curvature must be > 0");
+    if (!(gap >= 0.0)) throw std::invalid_argument("chord_bound: the gap must be >= 0");
+    return 0.8 * std::sqrt(4.0 * radius * gap);
+}
+
+double widest_binding_gap(double radius, double target) {
+    if (!(radius > 0.0)) throw std::invalid_argument("widest_binding_gap: the radius of curvature must be > 0");
+    if (!(target > 0.0)) throw std::invalid_argument("widest_binding_gap: the target must be > 0");
+    return std::min((target / 0.8) * (target / 0.8) / (4.0 * radius), radius / 0.32);
+}
+
+bool surfaces_face(double cos_normals, double radius, double target) {
+    if (!(radius > 0.0)) throw std::invalid_argument("surfaces_face: the radius of curvature must be > 0");
+    if (!(target > 0.0)) throw std::invalid_argument("surfaces_face: the target must be > 0");
+    const double alpha = std::acos(std::clamp(-cos_normals, -1.0, 1.0));   // 0 between the parallel walls of a gap
+    return alpha < std::min(target / (2.0 * radius), 0.5 * std::numbers::pi);
+}
+
 double skin_depth(double f_hz, double sigma, double mur) {
     if (!(f_hz > 0.0))  throw std::invalid_argument("skin_depth: frequency must be > 0");
     if (!(sigma > 0.0)) throw std::invalid_argument("skin_depth: conductivity must be > 0");
@@ -223,6 +278,92 @@ std::vector<int> algorithm_chain_2d(bool boundary_layer) {
     return { 6, 5 };                        // Frontal-Delaunay -> Delaunay
 }
 
+int outer_face_algorithm_2d() { return 5; }
+
+std::size_t nodes_in_enclosed_fine_zone(int algorithm2d) {
+    if (gmsh::isInitialized()) throw std::runtime_error("nodes_in_enclosed_fine_zone: a gmsh session is already open");
+    gmsh::initialize();
+    struct Close { ~Close() { gmsh::finalize(); } } close;
+    go::setNumber("General.Terminal", 0);
+    gmsh::model::add("enclosed_fine_zone");
+    const double mm = 1e-3;
+    const int face = gmsh::model::occ::addRectangle(-22.5 * mm, -22.5 * mm, 0.0, 45.0 * mm, 45.0 * mm);
+    const int a = gmsh::model::occ::addPoint(0.0, -8.0 * mm, -3.64 * mm), b = gmsh::model::occ::addPoint(0.0, 8.0 * mm, -3.64 * mm);
+    const int line = gmsh::model::occ::addLine(a, b);
+    gmsh::model::occ::synchronize();
+    const int df = gf::add("Distance");
+    gf::setNumbers(df, "CurvesList", {static_cast<double>(line)});
+    gf::setNumber(df, "Sampling", 200);
+    const int tf = gf::add("Threshold");
+    gf::setNumber(tf, "InField", df);
+    gf::setNumber(tf, "SizeMin", 0.67 * mm);
+    gf::setNumber(tf, "SizeMax", 10.0 * mm);
+    gf::setNumber(tf, "DistMin", 5.35 * mm);
+    gf::setNumber(tf, "DistMax", 10.0 * mm);
+    gf::setNumber(tf, "StopAtDistMax", 1);
+    const int cf = gf::add("MathEval");
+    gf::setString(cf, "F", "0.01");
+    const int mf = gf::add("Min");
+    gf::setNumbers(mf, "FieldsList", {static_cast<double>(tf), static_cast<double>(cf)});
+    gf::setAsBackgroundMesh(mf);
+    go::setNumber("Mesh.MeshSizeFromPoints", 0);
+    go::setNumber("Mesh.MeshSizeExtendFromBoundary", 0);
+    go::setNumber("Mesh.MeshSizeFromCurvature", 0);
+    gmsh::model::mesh::setAlgorithm(2, face, algorithm2d);
+    gmsh::model::mesh::generate(2);
+    std::vector<std::size_t> tags; std::vector<double> xyz, uv;
+    gmsh::model::mesh::getNodes(tags, xyz, uv, 2, face, /*includeBoundary=*/true);
+    std::size_t inside = 0;
+    for (std::size_t i = 0; i + 2 < xyz.size(); i += 3)
+        if (std::fabs(xyz[i]) < 4.0 * mm && std::fabs(xyz[i + 1]) < 8.0 * mm) ++inside;
+    return inside;
+}
+
+int faceted_wire_face_algorithm_2d() { return 5; }
+
+std::size_t flat_tets_in_faceted_bend(int algorithm2d) {
+    if (gmsh::isInitialized()) throw std::runtime_error("flat_tets_in_faceted_bend: a gmsh session is already open");
+    gmsh::initialize();
+    struct Close { ~Close() { gmsh::finalize(); } } close;
+    go::setNumber("General.Terminal", 0);
+    go::setNumber("General.NumThreads", 1);
+    gmsh::model::add("faceted_bend");
+    namespace occ = gmsh::model::occ;
+    const double mm = 1e-3, r = 0.3767 * mm, bend = 1.835 * mm - r;
+    const int n = 12;
+    std::vector<int> points, lines;
+    for (int k = 0; k < n; ++k) {
+        const double a = 2.0 * std::acos(-1.0) * k / n;   // a vertex on the bend's outer equator
+        points.push_back(occ::addPoint(bend + r * std::cos(a), r * std::sin(a), 0.0));
+    }
+    for (int k = 0; k < n; ++k) lines.push_back(occ::addLine(points[k], points[(k + 1) % n]));
+    const int section = occ::addPlaneSurface({occ::addCurveLoop(lines)});
+    gmsh::vectorpair turned, in, out;
+    occ::revolve({{2, section}}, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, std::acos(-1.0) / 2.0, turned);
+    if (turned.empty() || turned.front().first != 2)
+        throw std::runtime_error("flat_tets_in_faceted_bend: the revolve did not return its end face first");
+    occ::extrude({{2, section}}, 0.0, 0.0, 6.0 * mm, in);
+    occ::extrude({turned.front()}, -6.0 * mm, 0.0, 0.0, out);
+    occ::removeAllDuplicates();
+    occ::synchronize();
+    go::setNumber("Mesh.MeshSizeMin", 0.48 * mm);
+    go::setNumber("Mesh.MeshSizeMax", 0.48 * mm);
+    go::setNumber("Mesh.MeshSizeFromPoints", 0);
+    go::setNumber("Mesh.MeshSizeExtendFromBoundary", 0);
+    go::setNumber("Mesh.MeshSizeFromCurvature", 0);
+    go::setNumber("Mesh.Algorithm3D", 1);
+    gmsh::vectorpair faces;
+    gmsh::model::getEntities(faces, 2);
+    for (const auto& f : faces) gmsh::model::mesh::setAlgorithm(2, f.second, algorithm2d);
+    gmsh::model::mesh::generate(3);
+    std::vector<std::size_t> tets, nodeTags;
+    gmsh::model::mesh::getElementsByType(4, tets, nodeTags);
+    if (tets.empty()) throw std::runtime_error("flat_tets_in_faceted_bend: the bend did not mesh");
+    std::vector<double> gamma;
+    gmsh::model::mesh::getElementQualities(tets, gamma, "gamma");
+    return static_cast<std::size_t>(std::count_if(gamma.begin(), gamma.end(), [](double g) { return g < 0.1; }));
+}
+
 static std::size_t element_count(int dim) {
     std::vector<int> et; std::vector<std::vector<std::size_t>> en, ev;
     gmsh::model::mesh::getElements(et, en, ev, dim);
@@ -314,6 +455,21 @@ static int fork_attempt(int dim, int algo, const std::string& algo_opt, bool esc
 // forwarded to the real stdout only when OMFEM_GMSH_VERBOSE asked for it, so a default run prints
 // exactly what it printed before plus the rate lines on stderr. Anything else that writes to
 // stdout during the generate step is captured too -- the mesher writes its own logs to stderr.
+//
+// It needs a second thread, and the single-threaded WASM build has none: there std::thread's constructor
+// throws "Resource temporarily unavailable", which made EVERY 3D mesh in the browser fail (found 2026-11-22
+// by meshing in the built module; the quick WASM suite meshes nothing). Without threads the rate cannot be
+// read while generate() runs, so that build says so once and meshes unmonitored.
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+class RefinementRateMonitor {
+public:
+    RefinementRateMonitor() {
+        std::fprintf(stderr, "[mesh] 3D refinement rate: not monitored, this build has no threads\n");
+    }
+    RefinementRateMonitor(const RefinementRateMonitor&) = delete;
+    RefinementRateMonitor& operator=(const RefinementRateMonitor&) = delete;
+};
+#else
 class RefinementRateMonitor {
 public:
     RefinementRateMonitor() {
@@ -333,7 +489,17 @@ public:
         close(fds[1]);
         _readEnd = fds[0];
         go::setNumber("General.Terminal", 1);
-        _reader = std::thread([this] { read_loop(); });
+        try {
+            _reader = std::thread([this] { read_loop(); });
+        } catch (const std::exception& e) {
+            // The destructor does not run for a constructor that throws: give stdout back here.
+            go::setNumber("General.Terminal", _terminalWas);
+            std::fflush(stdout);
+            dup2(_savedStdout, STDOUT_FILENO);
+            close(_savedStdout);
+            close(_readEnd);
+            throw std::runtime_error(std::string("refinement-rate monitor: no reader thread: ") + e.what());
+        }
     }
     ~RefinementRateMonitor() {
         go::setNumber("General.Terminal", _terminalWas);
@@ -407,6 +573,7 @@ private:
     long _iterations = 0, _firstIt = 0, _windowIt = 0;
     double _firstTime = 0, _windowTime = 0, _lastTime = 0, _lastRadius = 0;
 };
+#endif
 
 int generate_robust(int dim, const std::vector<int>& chain) {
     const std::string algo_opt = (dim == 3) ? "Mesh.Algorithm3D" : "Mesh.Algorithm";
@@ -522,6 +689,48 @@ double seconds_now() {
     return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 }  // namespace
+
+void require_tet_quality() {
+    double floor = 1e-6;
+    if (const char* v = std::getenv("OMFEM_MESH_QMIN")) {
+        char* end = nullptr;
+        floor = std::strtod(v, &end);
+        if (end == v || *end != '\0' || !(floor >= 0.0))
+            throw std::invalid_argument(std::string("mesher.quality_floor must be a number >= 0, got '") + v + "'");
+    }
+    if (floor == 0.0) return;
+    std::vector<int> et; std::vector<std::vector<std::size_t>> en, ev;
+    gmsh::model::mesh::getElements(et, en, ev, 3);
+    std::vector<std::size_t> tets;
+    for (std::size_t i = 0; i < et.size(); ++i)
+        if (et[i] == 4) tets.insert(tets.end(), en[i].begin(), en[i].end());
+    if (tets.empty()) return;
+    std::vector<double> q;
+    gmsh::model::mesh::getElementQualities(tets, q, "gamma");
+    std::size_t below = 0, worst = 0;
+    for (std::size_t i = 0; i < q.size(); ++i) {
+        if (q[i] < floor) ++below;
+        if (q[i] < q[worst]) worst = i;
+    }
+    if (below == 0) return;
+    // where the worst one is, and in which region
+    int type = 0, dim = 0, tag = 0; std::vector<std::size_t> nodes;
+    gmsh::model::mesh::getElement(tets[worst], type, nodes, dim, tag);
+    double c[3] = {0.0, 0.0, 0.0};
+    for (std::size_t n : nodes) {
+        std::vector<double> xyz, uvw; int nd = 0, nt = 0;
+        gmsh::model::mesh::getNode(n, xyz, uvw, nd, nt);
+        for (int k = 0; k < 3; ++k) c[k] += xyz[static_cast<std::size_t>(k)] / static_cast<double>(nodes.size());
+    }
+    std::string region = "volume " + std::to_string(tag);
+    std::vector<int> groups; gmsh::model::getPhysicalGroupsForEntity(3, tag, groups);
+    if (!groups.empty()) gmsh::model::getPhysicalName(3, groups.front(), region);
+    char buf[512];
+    std::snprintf(buf, sizeof buf, "mesh quality: %zu of %zu tetrahedra are below the quality floor %g (mesher.quality_floor); "
+                  "the worst has gamma %.3g, in '%s' at (%.4f, %.4f, %.4f) mm", below, q.size(), floor, q[worst],
+                  region.c_str(), c[0] * 1e3, c[1] * 1e3, c[2] * 1e3);
+    throw std::runtime_error(buf);
+}
 
 void optimize_mesh(int topdim) {
     try {

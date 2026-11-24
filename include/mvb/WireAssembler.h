@@ -110,6 +110,11 @@ struct Spiral {
     // here and is refused where it would be made). This is what joins a helix to the level run
     // past its station tangentially, where a plain junction left a C0 kink of the pitch angle.
     bool levelOut = false;
+    // ABT #2450: the slope a levelOut piece ARRIVES with, in units of its mean slope (y1 - y0) / (az1 - az0): 0 is
+    // the climb easing into level above. Any other value is the same quadratic between two helices of different
+    // pitch: y = y0 + (y1 - y0) (a t + (1 - a) t^2) with a = 2 - easeEndRate, so the slope runs linearly from a to
+    // easeEndRate times the mean. Read only where levelOut is set.
+    double easeEndRate = 0.0;
     // ABT #1528: a climb easing FOLDED INTO the level run after it (assembleWire does this when
     // the easing is shorter than one facet chord, whose facets would be micron strips). For
     // t in [0, easeIn] the height's slope falls linearly from 2 (y1 - y0) / easeIn to zero --
@@ -130,7 +135,7 @@ inline double spiralRadiusFracRate(const Spiral& sp, double t) {
 }
 inline double spiralHeightFrac(const Spiral& sp, double t) {
     if (sp.blend) return 0.5 * (1.0 - std::cos(std::numbers::pi * t));
-    if (sp.levelOut) return t * (2.0 - t);
+    if (sp.levelOut) { const double a = 2.0 - sp.easeEndRate; return t * (a + (1.0 - a) * t); }
     if (sp.easeIn > 0.0) {
         const double e = sp.easeIn;
         return t < e ? (2.0 / e) * (t - t * t / (2.0 * e)) : 1.0;
@@ -139,13 +144,13 @@ inline double spiralHeightFrac(const Spiral& sp, double t) {
 }
 inline double spiralHeightFracRate(const Spiral& sp, double t) {
     if (sp.blend) return 0.5 * std::numbers::pi * std::sin(std::numbers::pi * t);
-    if (sp.levelOut) return 2.0 * (1.0 - t);
+    if (sp.levelOut) { const double a = 2.0 - sp.easeEndRate; return a + 2.0 * (1.0 - a) * t; }
     if (sp.easeIn > 0.0) return t < sp.easeIn ? (2.0 / sp.easeIn) * (1.0 - t / sp.easeIn) : 0.0;
     return 1.0;
 }
 inline double spiralHeightFracCurvature(const Spiral& sp, double t) {
     if (sp.blend) return 0.5 * std::numbers::pi * std::numbers::pi * std::cos(std::numbers::pi * t);
-    if (sp.levelOut) return -2.0;
+    if (sp.levelOut) return 2.0 * (sp.easeEndRate - 1.0);
     if (sp.easeIn > 0.0) return t < sp.easeIn ? -2.0 / (sp.easeIn * sp.easeIn) : 0.0;
     return 0.0;
 }
@@ -174,6 +179,13 @@ struct Primitive {
     // for that fillet, e.g. a rect column, where the fan does not run): filletDeferredLeadCorners bends them once the
     // terminal fillet has taken its share of the attach leg.
     bool deferredCorners = false;
+    // A dragback's end straight on a radial step that is ALL BEND (it rises no more than its two quarter bends are
+    // deep, ABT #2474): the radius its two bends share -- the end fillet on the wrap's circle and the step's own
+    // corner -- so that they meet with no straight between them. filletHelixCorners solves it and draws the fillet;
+    // filletInteriorCornersOf draws the corner at the leg's end / start. Empty: MKF's radius, and the straight is
+    // whatever the two bends leave.
+    std::optional<double> endBendRadius;
+    std::optional<double> startBendRadius;
     // An inter-layer link (MKF's blue ConnectionReservedSpace box): the straight radial
     // step that carries the wire from one concentric layer out to the next. Like a lead it
     // meets its neighbouring wraps at 90-degree corners, so it is isolated into its own run
@@ -207,6 +219,12 @@ enum class WeldMode { Off, Auto, All };
 // The build default when nothing asks for a mode: All when the environment sets MVB_WELD_ALL
 // (the step tools and the mesh recipe's geometry.weld_all), else Auto.
 WeldMode weldModeFromEnv();
+// The collision debug drawing (--skip-collision-check): a mitred corner that does not abut is reported as a FINDING
+// and the copper kept as built, instead of refusing the build. Thread-local; off by default.
+void setAbutmentFinding(bool on);
+// A display drawing (the wire at its outer diameter, a picture of the winding): while set on this thread, the
+// assembler does not judge whether its mitred corners abut (ABT #2489).
+void setDisplayDrawing(bool on);
 // "off" | "auto" | "all"; anything else throws std::invalid_argument naming it.
 WeldMode parseWeldMode(const std::string& name);
 const char* weldModeName(WeldMode mode);
@@ -314,5 +332,10 @@ bool primEdgeGrowsAnalytically(const Primitive& pr);
 // Post-checks on assembled copper.
 bool hasDegenerateSheetFace(const TopoDS_Shape& shape, double wireRadius);
 TopoDS_Shape pruneDegenerateSolids(const TopoDS_Shape& shape, double wireRadius);
+
+// True when `piece` (of volume `pieceVolume`) is proven to lie inside `host`: its box within the host's, every vertex in
+// or on the host, and a cut leaving under a hundredth of it outside. The assembler absorbs a piece into the copper before
+// it only on this proof; a refused or failed measure is "not inside".
+bool pieceLiesInside(const TopoDS_Shape& piece, double pieceVolume, const TopoDS_Shape& host);
 
 } // namespace mvb
